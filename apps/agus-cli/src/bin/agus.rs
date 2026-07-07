@@ -27,13 +27,21 @@ use agus_storage::create_storage_backend;
 use chrono::{
     DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Table,
+    Json,
+}
 
 #[derive(Parser)]
 #[command(name = "agus")]
 #[command(about = "Agus CLI", long_about = None)]
 struct AgusCli {
+    #[arg(long, default_value = "table", value_enum)]
+    format: OutputFormat,
     #[command(subcommand)]
     command: Option<AgusCommand>,
 }
@@ -93,6 +101,7 @@ enum HostCommand {
     Add(HostAddCommand),
     Remove(HostRemoveCommand),
     Show(HostShowCommand),
+    Check(HostCheckCommand),
 }
 
 #[derive(Args)]
@@ -129,6 +138,15 @@ struct HostRemoveCommand {
 struct HostShowCommand {
     #[arg(long)]
     id: String,
+}
+
+#[derive(Args)]
+struct HostCheckCommand {
+    #[arg(long)]
+    id: String,
+    /// 远端检测命令（默认：echo AGUS_OK）
+    #[arg(long, default_value = "echo AGUS_OK")]
+    cmd: String,
 }
 
 #[derive(Subcommand)]
@@ -450,7 +468,7 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("error: {err}");
-            std::process::exit(1);
+            std::process::exit(exit_code_from_error(&err));
         }
     }
 }
@@ -458,7 +476,7 @@ fn main() {
 fn run() -> Result<i32, CliError> {
     let cli = AgusCli::parse();
     match cli.command {
-        Some(command) => handle_command(command),
+        Some(command) => handle_command(command, cli.format),
         None => {
             run_repl()?;
             Ok(0)
@@ -466,21 +484,42 @@ fn run() -> Result<i32, CliError> {
     }
 }
 
-fn handle_command(command: AgusCommand) -> Result<i32, CliError> {
+fn handle_command(command: AgusCommand, format: OutputFormat) -> Result<i32, CliError> {
     match command {
         AgusCommand::Exec(cmd) => handle_exec(cmd),
-        AgusCommand::Host(cmd) => handle_host(cmd).map(|_| 0),
+        AgusCommand::Host(cmd) => handle_host(cmd, format).map(|_| 0),
         AgusCommand::Context(cmd) => handle_context(cmd).map(|_| 0),
         AgusCommand::Ssh(cmd) => handle_ssh(cmd).map(|_| 0),
         AgusCommand::Shell(cmd) => handle_shell(cmd).map(|_| 0),
         AgusCommand::Plan(cmd) => handle_plan(cmd).map(|_| 0),
-        AgusCommand::Deploy(cmd) => handle_deploy(cmd).map(|_| 0),
+        AgusCommand::Deploy(cmd) => handle_deploy(cmd, format).map(|_| 0),
         AgusCommand::Logs(cmd) => handle_logs(cmd).map(|_| 0),
         AgusCommand::Monitor(cmd) => handle_monitor(cmd).map(|_| 0),
         AgusCommand::Alert(cmd) => handle_alert(cmd).map(|_| 0),
         AgusCommand::Container(cmd) => handle_container(cmd).map(|_| 0),
         AgusCommand::Security(cmd) => handle_security(cmd).map(|_| 0),
         AgusCommand::Diagnose(cmd) => handle_diagnose(cmd).map(|_| 0),
+    }
+}
+
+fn exit_code_from_error(err: &CliError) -> i32 {
+    // 约定：可脚本化的稳定退出码
+    match err {
+        CliError::InvalidInput(message) => {
+            if message.to_lowercase().contains("not found") {
+                4
+            } else {
+                2
+            }
+        }
+        CliError::AdminMissing | CliError::AuthFailed => 3,
+        CliError::Config(_) => 2,
+        CliError::Ssh(ssh) => match ssh {
+            agus_ssh::SshError::Timeout { .. } => 124,
+            agus_ssh::SshError::Connection { .. } => 10,
+            agus_ssh::SshError::Command { .. } => 11,
+        },
+        CliError::Storage(_) | CliError::Io(_) | CliError::Json(_) => 1,
     }
 }
 
@@ -558,7 +597,7 @@ fn handle_exec(cmd: ExecCommand) -> Result<i32, CliError> {
     }
 }
 
-fn handle_host(cmd: HostCommand) -> Result<(), CliError> {
+fn handle_host(cmd: HostCommand, format: OutputFormat) -> Result<(), CliError> {
     match cmd {
         HostCommand::List => {
             let hosts = hosts::load_hosts()?;
@@ -567,16 +606,23 @@ fn handle_host(cmd: HostCommand) -> Result<(), CliError> {
                 return Ok(());
             }
             log_cli_event("cli host list");
-            for host in hosts {
-                println!(
-                    "{}\t{}\t{}:{}\t{:?}\t{}",
-                    host.id,
-                    host.address,
-                    host.user,
-                    host.port,
-                    host.environment,
-                    host.labels.join(",")
-                );
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&hosts)?);
+                }
+                OutputFormat::Table => {
+                    for host in hosts {
+                        println!(
+                            "{}\t{}\t{}:{}\t{:?}\t{}",
+                            host.id,
+                            host.address,
+                            host.user,
+                            host.port,
+                            host.environment,
+                            host.labels.join(",")
+                        );
+                    }
+                }
             }
         }
         HostCommand::Add(cmd) => {
@@ -618,17 +664,72 @@ fn handle_host(cmd: HostCommand) -> Result<(), CliError> {
         HostCommand::Show(cmd) => {
             let host = hosts::find_host(&cmd.id)?;
             log_cli_event(&format!("cli host show id={}", cmd.id));
-            println!("id: {}", host.id);
-            println!("address: {}", host.address);
-            println!("user: {}", host.user);
-            println!("port: {}", host.port);
-            println!("environment: {:?}", host.environment);
-            println!("labels: {}", host.labels.join(","));
-            if let Some(group) = host.group_id {
-                println!("group: {group}");
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&host)?);
+                }
+                OutputFormat::Table => {
+                    println!("id: {}", host.id);
+                    println!("address: {}", host.address);
+                    println!("user: {}", host.user);
+                    println!("port: {}", host.port);
+                    println!("environment: {:?}", host.environment);
+                    println!("labels: {}", host.labels.join(","));
+                    if let Some(group) = host.group_id {
+                        println!("group: {group}");
+                    }
+                    if let Some(identity) = host.identity_file {
+                        println!("identity_file: {identity}");
+                    }
+                }
             }
-            if let Some(identity) = host.identity_file {
-                println!("identity_file: {identity}");
+        }
+        HostCommand::Check(cmd) => {
+            let host = hosts::find_host(&cmd.id)?;
+            log_cli_event(&format!("cli host check id={}", cmd.id));
+            let target = exec::ssh_target_from_host(&host);
+            let client = ProcessSshClient::new();
+            let result = client.execute(&target, &cmd.cmd);
+            match (format, result) {
+                (OutputFormat::Json, Ok(output)) => {
+                    let value = serde_json::json!({
+                        "host_id": host.id,
+                        "address": host.address,
+                        "ok": output.exit_code == 0,
+                        "exit_code": output.exit_code,
+                        "stdout": output.stdout,
+                        "stderr": output.stderr,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                }
+                (OutputFormat::Json, Err(err)) => {
+                    let value = serde_json::json!({
+                        "host_id": host.id,
+                        "address": host.address,
+                        "ok": false,
+                        "error": err.to_string(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Err(CliError::Ssh(err));
+                }
+                (OutputFormat::Table, Ok(output)) => {
+                    if output.exit_code == 0 {
+                        println!("OK\t{}\t{}", host.id, host.address);
+                    } else {
+                        println!("FAIL\t{}\t{}\texit={}", host.id, host.address, output.exit_code);
+                        if !output.stderr.trim().is_empty() {
+                            println!("{}", output.stderr.trim());
+                        }
+                        return Err(CliError::Ssh(agus_ssh::SshError::Command {
+                            exit_code: output.exit_code,
+                            stderr: output.stderr,
+                        }));
+                    }
+                }
+                (OutputFormat::Table, Err(err)) => {
+                    println!("FAIL\t{}\t{}\t{}", host.id, host.address, err);
+                    return Err(CliError::Ssh(err));
+                }
             }
         }
     }
@@ -770,13 +871,13 @@ fn handle_plan(cmd: PlanCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn handle_deploy(cmd: DeployCommand) -> Result<(), CliError> {
+fn handle_deploy(cmd: DeployCommand, format: OutputFormat) -> Result<(), CliError> {
     match cmd {
         DeployCommand::Run(cmd) => handle_deploy_run(cmd),
-        DeployCommand::Status(cmd) => handle_deploy_status(cmd),
+        DeployCommand::Status(cmd) => handle_deploy_status(cmd, format),
         DeployCommand::Logs(cmd) => handle_deploy_logs(cmd),
         DeployCommand::Resume(cmd) => handle_deploy_resume(cmd),
-        DeployCommand::List => handle_deploy_list(),
+        DeployCommand::List => handle_deploy_list(format),
         DeployCommand::Clean(cmd) => handle_deploy_clean(cmd),
     }
 }
@@ -880,19 +981,26 @@ fn handle_deploy_run(cmd: DeployRunCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn handle_deploy_status(cmd: DeployStatusCommand) -> Result<(), CliError> {
+fn handle_deploy_status(cmd: DeployStatusCommand, format: OutputFormat) -> Result<(), CliError> {
     let records = executions::load_records(&cmd.execution_id)?;
     if records.is_empty() {
         println!("No execution records found.");
         return Ok(());
     }
-    for record in records {
-        println!(
-            "{}\t{:?}\t{}",
-            record.step_id,
-            record.status,
-            record.error.clone().unwrap_or_default()
-        );
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        }
+        OutputFormat::Table => {
+            for record in records {
+                println!(
+                    "{}\t{:?}\t{}",
+                    record.step_id,
+                    record.status,
+                    record.error.clone().unwrap_or_default()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -959,23 +1067,30 @@ fn handle_deploy_resume(cmd: DeployResumeCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn handle_deploy_list() -> Result<(), CliError> {
+fn handle_deploy_list(format: OutputFormat) -> Result<(), CliError> {
     let sessions = executions::list_sessions()?;
     if sessions.is_empty() {
         println!("No execution sessions found.");
         return Ok(());
     }
-    for session in sessions {
-        println!(
-            "{}\t{}\t{}\t{}",
-            session.execution_id,
-            session.mode,
-            session
-                .host_id
-                .clone()
-                .unwrap_or_else(|| "local".to_string()),
-            session.started_at
-        );
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&sessions)?);
+        }
+        OutputFormat::Table => {
+            for session in sessions {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    session.execution_id,
+                    session.mode,
+                    session
+                        .host_id
+                        .clone()
+                        .unwrap_or_else(|| "local".to_string()),
+                    session.started_at
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2184,7 +2299,7 @@ fn run_repl() -> Result<(), CliError> {
             match AgusCli::try_parse_from(argv) {
                 Ok(cli) => {
                     if let Some(command) = cli.command {
-                        let _ = handle_command(command)?;
+                        let _ = handle_command(command, cli.format)?;
                     }
                 }
                 Err(err) => eprintln!("{err}"),
@@ -2291,7 +2406,7 @@ struct LlmCliResponse {
     explanation: Option<String>,
     risk_level: Option<String>,
     answer: Option<String>,
-    description_zh: Option<String>,  // 中文描述
+    description_zh: Option<String>, // 中文描述
     agus_command: Option<String>,   // 转换后的 agus 命令
 }
 
@@ -2304,8 +2419,9 @@ fn is_chinese_natural_language(input: &str) -> bool {
             '\u{3400}'..='\u{4dbf}' |  // CJK 扩展 A
             '\u{20000}'..='\u{2a6df}'  // CJK 扩展 B
         )
-    }) && !input.trim().starts_with("agus ") && !input.trim().starts_with("exec ") && 
-         !risk::is_traditional_command(input.split_whitespace().next().unwrap_or(""))
+    }) && !input.trim().starts_with("agus ")
+        && !input.trim().starts_with("exec ")
+        && !risk::is_traditional_command(input.split_whitespace().next().unwrap_or(""))
 }
 
 // 获取用户语言偏好（从环境变量或系统语言）
@@ -2318,14 +2434,14 @@ fn get_user_language() -> Language {
             _ => {}
         }
     }
-    
+
     // 检查系统语言环境
     if let Ok(lang) = std::env::var("LANG") {
         if lang.to_lowercase().contains("zh") {
             return Language::Zh;
         }
     }
-    
+
     // 默认英文
     Language::En
 }
@@ -2427,10 +2543,10 @@ fn handle_llm_command(
 
         if let Some(cmd) = command_to_execute {
             let risk_level = risk::classify_command(cmd);
-            
+
             // 显示建议的命令
             println!("{}: {}", t("suggested_command"), cmd);
-            
+
             // 显示风险级别
             if let Some(level) = parsed
                 .risk_level
@@ -2440,7 +2556,7 @@ fn handle_llm_command(
                 println!("{}: {}", t("risk_level"), level);
             }
             println!("{}: {}", t("detected_risk"), risk_level_label(risk_level));
-            
+
             // 确认执行
             if prompt_yes_no(&format!("{} ", t("execute_confirm")))? {
                 println!("{}", t("command_executed"));
@@ -2492,7 +2608,7 @@ fn execute_generated_command(
         match AgusCli::try_parse_from(argv) {
             Ok(cli) => {
                 if let Some(command) = cli.command {
-                    let _ = handle_command(command)?;
+                    let _ = handle_command(command, cli.format)?;
                 }
                 return Ok(());
             }
@@ -2550,14 +2666,19 @@ fn parse_llm_response(raw: &str) -> Option<LlmCliResponse> {
     serde_json::from_str::<LlmCliResponse>(&trimmed[json_start..=json_end]).ok()
 }
 
-fn build_llm_prompt(input: &str, force_local: bool, current_host: Option<&str>, is_chinese: bool) -> String {
+fn build_llm_prompt(
+    input: &str,
+    force_local: bool,
+    current_host: Option<&str>,
+    is_chinese: bool,
+) -> String {
     let host_hint = current_host.unwrap_or("local");
     let lang_instruction = if is_chinese {
         "用户使用中文输入，请用中文回复。"
     } else {
         "User is using English, please reply in English."
     };
-    
+
     let agus_commands_help = r#"
 Available agus commands:
 - agus host list/add/remove/show: 主机管理
@@ -2571,7 +2692,7 @@ Available agus commands:
 - agus security scan-junk/vulnerability: 安全扫描
 - agus diagnose error/performance: 诊断分析
 "#;
-    
+
     if is_chinese {
         format!(
             "你是一位 SRE 运维助手，帮助用户将自然语言转换为安全的 agus CLI 命令。\n\
@@ -2672,6 +2793,8 @@ fn parse_llm_provider(provider: &str) -> Result<LlmProviderType, CliError> {
         "deepseek" => Ok(LlmProviderType::DeepSeek),
         "zhipu" => Ok(LlmProviderType::Zhipu),
         "ollama" => Ok(LlmProviderType::Ollama),
+        "dashscope" => Ok(LlmProviderType::DashScope),
+        "nvidia-nim" => Ok(LlmProviderType::NvidiaNim),
         _ => Err(CliError::Config(format!(
             "unknown LLM provider: {provider}"
         ))),
@@ -2848,7 +2971,10 @@ fn prompt_yes_no(label: &str) -> Result<bool, CliError> {
     io::stdin().read_line(&mut input)?;
     let value = input.trim().to_lowercase();
     // 支持中文确认：y/yes/是/确认
-    Ok(matches!(value.as_str(), "y" | "yes" | "是" | "确认" | "ok" | "okay"))
+    Ok(matches!(
+        value.as_str(),
+        "y" | "yes" | "是" | "确认" | "ok" | "okay"
+    ))
 }
 
 fn prompt_line(label: &str) -> Result<String, CliError> {

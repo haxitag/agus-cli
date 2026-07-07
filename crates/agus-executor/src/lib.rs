@@ -3230,10 +3230,9 @@ pub struct RecommendedAction {
 }
 
 /// 构建执行分析的 Prompt
-pub fn build_execution_analysis_prompt(
-    state: &ExecutionState,
-) -> Result<String, ExecutionError> {
-    let prompt = format!(r#"
+pub fn build_execution_analysis_prompt(state: &ExecutionState) -> Result<String, ExecutionError> {
+    let prompt = format!(
+        r#"
 # 角色定义
 你是一位资深的 DevOps/SRE 工程师，负责监控和优化部署执行过程。
 
@@ -3351,7 +3350,7 @@ fn extract_json_from_execution_response(response: &str) -> String {
             return response[start + 7..start + end].trim().to_string();
         }
     }
-    
+
     // 尝试提取 ``` ... ``` 代码块
     if let Some(start) = response.find("```") {
         if let Some(end) = response[start + 3..].find("```") {
@@ -3361,14 +3360,14 @@ fn extract_json_from_execution_response(response: &str) -> String {
             }
         }
     }
-    
+
     // 尝试提取 {...} JSON 对象
     if let Some(start) = response.find('{') {
         if let Some(end) = response.rfind('}') {
             return response[start..=end].to_string();
         }
     }
-    
+
     response.to_string()
 }
 
@@ -3377,12 +3376,15 @@ pub fn parse_llm_execution_response(
     response: &str,
 ) -> Result<LLMExecutionAnalysis, ExecutionError> {
     let json_str = extract_json_from_execution_response(response);
-    
-    let analysis: LLMExecutionAnalysis = serde_json::from_str(&json_str)
-        .map_err(|e| ExecutionError::SessionError {
-            message: format!("Failed to parse LLM execution response: {}. Response: {}", e, json_str),
+
+    let analysis: LLMExecutionAnalysis =
+        serde_json::from_str(&json_str).map_err(|e| ExecutionError::SessionError {
+            message: format!(
+                "Failed to parse LLM execution response: {}. Response: {}",
+                e, json_str
+            ),
         })?;
-    
+
     Ok(analysis)
 }
 
@@ -3438,11 +3440,11 @@ impl LLMDrivenExecutionSession {
             let prompt = build_execution_analysis_prompt(&execution_state)?;
 
             // 4. 调用 LLM 分析
-            let llm_response = llm_provider
-                .complete_prompt(&prompt)
-                .map_err(|e| ExecutionError::SessionError {
+            let llm_response = llm_provider.complete_prompt(&prompt).map_err(|e| {
+                ExecutionError::SessionError {
                     message: format!("LLM analysis failed: {}", e),
-                })?;
+                }
+            })?;
 
             // 5. 解析 LLM 响应
             let analysis = parse_llm_execution_response(&llm_response)?;
@@ -3451,11 +3453,14 @@ impl LLMDrivenExecutionSession {
             {
                 let log_stream_clone = self.session.log_stream.clone();
                 if let Some(ref stream) = log_stream_clone {
-                    stream.info("llm_analysis", &format!(
-                        "LLM 分析: {}\n建议行动数: {}",
-                        analysis.status_analysis.summary,
-                        analysis.action_plan.recommended_actions.len()
-                    ));
+                    stream.info(
+                        "llm_analysis",
+                        &format!(
+                            "LLM 分析: {}\n建议行动数: {}",
+                            analysis.status_analysis.summary,
+                            analysis.action_plan.recommended_actions.len()
+                        ),
+                    );
                 }
             }
 
@@ -3478,10 +3483,10 @@ impl LLMDrivenExecutionSession {
                     if action.requires_approval {
                         // TODO: 等待用户审批（P1 功能）
                         if let Some(ref stream) = log_stream_clone {
-                            stream.warning("approval_required", &format!(
-                                "行动 {} 需要审批: {}",
-                                action.id, action.description
-                            ));
+                            stream.warning(
+                                "approval_required",
+                                &format!("行动 {} 需要审批: {}", action.id, action.description),
+                            );
                         }
                         // 暂时跳过需要审批的行动
                         continue;
@@ -3489,10 +3494,10 @@ impl LLMDrivenExecutionSession {
 
                     // 执行不需要审批的行动
                     if let Some(ref stream) = log_stream_clone {
-                        stream.info("action_executed", &format!(
-                            "执行行动 {}: {}",
-                            action.id, action.description
-                        ));
+                        stream.info(
+                            "action_executed",
+                            &format!("执行行动 {}: {}", action.id, action.description),
+                        );
                     }
                 }
             }
@@ -3552,13 +3557,19 @@ impl LLMDrivenExecutionSession {
     }
 
     /// 检查部署是否完成
-    fn is_deployment_complete(&self, analysis: &LLMExecutionAnalysis) -> Result<bool, ExecutionError> {
+    fn is_deployment_complete(
+        &self,
+        analysis: &LLMExecutionAnalysis,
+    ) -> Result<bool, ExecutionError> {
         // 如果所有步骤都完成，或者 LLM 建议停止
         Ok(!analysis.action_plan.should_continue)
     }
 
     /// 推进到下一步
-    fn advance_to_next_step(&mut self, _analysis: &LLMExecutionAnalysis) -> Result<(), ExecutionError> {
+    fn advance_to_next_step(
+        &mut self,
+        _analysis: &LLMExecutionAnalysis,
+    ) -> Result<(), ExecutionError> {
         // TODO: 更新 session 的状态，推进到下一步
         Ok(())
     }

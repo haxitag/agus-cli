@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agus-cli"
-version = "0.1.6"
+version = "0.2.1"
 dependencies = [
  "agus-cli-core",
  "agus-core-domain",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "agus-ui"
-version = "0.1.6"
+version = "0.2.1"
 dependencies = [
  "agus-cloud",
  "agus-context-engine",

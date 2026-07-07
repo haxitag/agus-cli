@@ -63,8 +63,8 @@ impl From<SshError> for ObserverError {
         match err {
             SshError::Connection { message } => ObserverError::Connection { message },
             SshError::Command { exit_code, stderr } => ObserverError::Command { exit_code, stderr },
-            SshError::Timeout { message } => ObserverError::Connection { 
-                message: format!("timeout: {}", message) 
+            SshError::Timeout { message } => ObserverError::Connection {
+                message: format!("timeout: {}", message),
             },
         }
     }
@@ -100,8 +100,8 @@ impl From<SshError> for DbSchemaError {
         match err {
             SshError::Connection { message } => DbSchemaError::Connection { message },
             SshError::Command { exit_code, stderr } => DbSchemaError::Command { exit_code, stderr },
-            SshError::Timeout { message } => DbSchemaError::Connection { 
-                message: format!("timeout: {}", message) 
+            SshError::Timeout { message } => DbSchemaError::Connection {
+                message: format!("timeout: {}", message),
             },
         }
     }
@@ -372,6 +372,10 @@ pub enum RepoScanError {
     Io { message: String },
     Parse { message: String },
     DuplicateService { name: String },
+    DuplicateServiceDetailed {
+        name: String,
+        sources: Vec<DuplicateServiceSource>,
+    },
     CycleDetected { message: String },
 }
 
@@ -384,6 +388,18 @@ impl std::fmt::Display for RepoScanError {
             RepoScanError::DuplicateService { name } => {
                 write!(f, "duplicate service name: {name}")
             }
+            RepoScanError::DuplicateServiceDetailed { name, sources } => {
+                if sources.is_empty() {
+                    write!(f, "duplicate service name: {name}")
+                } else {
+                    let paths = sources
+                        .iter()
+                        .map(|source| format!("{}:{}", source.source_type, source.path))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, "duplicate service name: {name}; sources: {paths}")
+                }
+            }
             RepoScanError::CycleDetected { message } => write!(f, "cycle detected: {message}"),
         }
     }
@@ -391,13 +407,129 @@ impl std::fmt::Display for RepoScanError {
 
 impl std::error::Error for RepoScanError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateServiceSource {
+    pub source_type: String,
+    pub path: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateServicePolicy {
+    Error,
+    PreferCompose,
+    PreferDockerfile,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposeServiceInfo {
     ports: Vec<u16>,
     references: Vec<String>,
 }
 
+const DUPLICATE_EXCERPT_MAX_LINES: usize = 12;
+const DUPLICATE_EXCERPT_MAX_CHARS: usize = 200;
+
+fn clamp_excerpt_line(line: &str) -> String {
+    if line.len() > DUPLICATE_EXCERPT_MAX_CHARS {
+        let mut trimmed = line[..DUPLICATE_EXCERPT_MAX_CHARS].to_string();
+        trimmed.push('…');
+        trimmed
+    } else {
+        line.to_string()
+    }
+}
+
+fn extract_compose_service_excerpt(
+    contents: &str,
+    service_name: &str,
+    max_lines: usize,
+) -> String {
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut services_indent: Option<usize> = None;
+    let mut service_start: Option<usize> = None;
+    let mut service_indent = 0usize;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "services:" || trimmed.starts_with("services:") {
+            services_indent = Some(line.len() - trimmed.len());
+            continue;
+        }
+        if let Some(base_indent) = services_indent {
+            let indent = line.len() - trimmed.len();
+            if indent <= base_indent {
+                continue;
+            }
+            if trimmed.starts_with(&format!("{}:", service_name)) {
+                service_start = Some(idx);
+                service_indent = indent;
+                break;
+            }
+        }
+    }
+
+    if let Some(start) = service_start {
+        let mut excerpt = Vec::new();
+        for idx in start..lines.len() {
+            let line = lines[idx];
+            let trimmed = line.trim_start();
+            if idx != start {
+                let indent = line.len() - trimmed.len();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') && indent <= service_indent {
+                    break;
+                }
+            }
+            excerpt.push(clamp_excerpt_line(line));
+            if excerpt.len() >= max_lines {
+                break;
+            }
+        }
+        return excerpt.join("\n");
+    }
+
+    lines
+        .iter()
+        .take(max_lines)
+        .map(|line| clamp_excerpt_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_dockerfile_excerpt(path: &Path, max_lines: usize) -> String {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return String::new();
+    };
+
+    let mut excerpt = Vec::new();
+    for line in contents.lines() {
+        if line.trim().is_empty() && excerpt.is_empty() {
+            continue;
+        }
+        excerpt.push(clamp_excerpt_line(line));
+        if excerpt.len() >= max_lines {
+            break;
+        }
+    }
+
+    excerpt.join("\n")
+}
+
 pub fn scan_repo_basic(path: &Path) -> Result<ServiceDependencyGraph, RepoScanError> {
+    scan_repo_basic_with_policy(path, DuplicateServicePolicy::Error)
+}
+
+pub fn scan_repo_basic_with_policy(
+    path: &Path,
+    duplicate_policy: DuplicateServicePolicy,
+) -> Result<ServiceDependencyGraph, RepoScanError> {
+    eprintln!("[scan_repo_basic] Scanning path: {}", path.display());
+
     if !path.exists() {
         return Err(RepoScanError::InvalidPath {
             message: "path does not exist".to_string(),
@@ -412,19 +544,62 @@ pub fn scan_repo_basic(path: &Path) -> Result<ServiceDependencyGraph, RepoScanEr
     let mut dockerfiles = Vec::new();
     let mut compose_files = Vec::new();
     collect_repo_files(path, &mut dockerfiles, &mut compose_files)?;
+    eprintln!(
+        "[scan_repo_basic] Found {} dockerfiles, {} compose files",
+        dockerfiles.len(),
+        compose_files.len()
+    );
 
     let mut services_by_name: HashMap<String, Service> = HashMap::new();
     let mut compose_info_by_name: HashMap<String, ComposeServiceInfo> = HashMap::new();
+    let mut compose_source_by_name: HashMap<String, String> = HashMap::new();
+    let mut compose_excerpt_by_name: HashMap<String, String> = HashMap::new();
+    let mut dockerfile_source_by_name: HashMap<String, String> = HashMap::new();
+    let mut dockerfile_excerpt_by_name: HashMap<String, String> = HashMap::new();
 
     for compose_path in compose_files {
         let contents = fs::read_to_string(&compose_path).map_err(|err| RepoScanError::Io {
             message: format!("failed to read {}: {err}", compose_path.display()),
         })?;
-        let parsed = parse_compose_services(&contents)?;
+        let parsed = parse_compose_services(&contents).map_err(|e| {
+            eprintln!(
+                "[scan_repo_basic] Failed to parse compose file {}: {}",
+                compose_path.display(),
+                e
+            );
+            e
+        })?;
+
+        let compose_path_display = compose_path.display().to_string();
         for (name, info) in parsed {
-            if compose_info_by_name.contains_key(&name) {
-                return Err(RepoScanError::DuplicateService { name });
+            let excerpt = extract_compose_service_excerpt(
+                &contents,
+                &name,
+                DUPLICATE_EXCERPT_MAX_LINES,
+            );
+            if let Some(existing_path) = compose_source_by_name.get(&name) {
+                let existing_excerpt = compose_excerpt_by_name
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                return Err(RepoScanError::DuplicateServiceDetailed {
+                    name,
+                    sources: vec![
+                        DuplicateServiceSource {
+                            source_type: "compose".to_string(),
+                            path: existing_path.clone(),
+                            excerpt: existing_excerpt,
+                        },
+                        DuplicateServiceSource {
+                            source_type: "compose".to_string(),
+                            path: compose_path_display.clone(),
+                            excerpt,
+                        },
+                    ],
+                });
             }
+            compose_source_by_name.insert(name.clone(), compose_path_display.clone());
+            compose_excerpt_by_name.insert(name.clone(), excerpt);
             compose_info_by_name.insert(name, info);
         }
     }
@@ -435,17 +610,65 @@ pub fn scan_repo_basic(path: &Path) -> Result<ServiceDependencyGraph, RepoScanEr
             kind: ServiceKind::ComposeService,
             exposed_ports: info.ports.clone(),
         };
-        insert_service(&mut services_by_name, service)?;
+        insert_service_with_policy(&mut services_by_name, service, duplicate_policy)?;
     }
 
     for dockerfile in dockerfiles {
         let name = derive_service_name(path, &dockerfile)?;
+        let dockerfile_path_display = dockerfile.display().to_string();
+        let excerpt = extract_dockerfile_excerpt(&dockerfile, DUPLICATE_EXCERPT_MAX_LINES);
+        if let Some(existing_path) = dockerfile_source_by_name.get(&name) {
+            let existing_excerpt = dockerfile_excerpt_by_name
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            return Err(RepoScanError::DuplicateServiceDetailed {
+                name,
+                sources: vec![
+                    DuplicateServiceSource {
+                        source_type: "dockerfile".to_string(),
+                        path: existing_path.clone(),
+                        excerpt: existing_excerpt,
+                    },
+                    DuplicateServiceSource {
+                        source_type: "dockerfile".to_string(),
+                        path: dockerfile_path_display.clone(),
+                        excerpt,
+                    },
+                ],
+            });
+        }
+        dockerfile_source_by_name.insert(name.clone(), dockerfile_path_display.clone());
+        dockerfile_excerpt_by_name.insert(name.clone(), excerpt.clone());
+        if duplicate_policy == DuplicateServicePolicy::Error {
+            if let Some(compose_path) = compose_source_by_name.get(&name) {
+                let compose_excerpt = compose_excerpt_by_name
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                return Err(RepoScanError::DuplicateServiceDetailed {
+                    name,
+                    sources: vec![
+                        DuplicateServiceSource {
+                            source_type: "compose".to_string(),
+                            path: compose_path.clone(),
+                            excerpt: compose_excerpt,
+                        },
+                        DuplicateServiceSource {
+                            source_type: "dockerfile".to_string(),
+                            path: dockerfile_path_display.clone(),
+                            excerpt: excerpt.clone(),
+                        },
+                    ],
+                });
+            }
+        }
         let service = Service {
             name,
             kind: ServiceKind::Dockerfile,
             exposed_ports: Vec::new(),
         };
-        insert_service(&mut services_by_name, service)?;
+        insert_service_with_policy(&mut services_by_name, service, duplicate_policy)?;
     }
 
     let edges = build_dependency_edges(&compose_info_by_name, &services_by_name);
@@ -463,9 +686,42 @@ fn insert_service(
     services: &mut HashMap<String, Service>,
     service: Service,
 ) -> Result<(), RepoScanError> {
-    if services.contains_key(&service.name) {
-        return Err(RepoScanError::DuplicateService { name: service.name });
+    insert_service_with_policy(services, service, DuplicateServicePolicy::Error)
+}
+
+fn insert_service_with_policy(
+    services: &mut HashMap<String, Service>,
+    service: Service,
+    duplicate_policy: DuplicateServicePolicy,
+) -> Result<(), RepoScanError> {
+    if let Some(existing) = services.get_mut(&service.name) {
+        match duplicate_policy {
+            DuplicateServicePolicy::Error => {
+                return Err(RepoScanError::DuplicateService { name: service.name });
+            }
+            DuplicateServicePolicy::PreferCompose => match (&existing.kind, &service.kind) {
+                (ServiceKind::ComposeService, ServiceKind::Dockerfile) => return Ok(()),
+                (ServiceKind::Dockerfile, ServiceKind::ComposeService) => {
+                    *existing = service;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(RepoScanError::DuplicateService { name: service.name });
+                }
+            },
+            DuplicateServicePolicy::PreferDockerfile => match (&existing.kind, &service.kind) {
+                (ServiceKind::Dockerfile, ServiceKind::ComposeService) => return Ok(()),
+                (ServiceKind::ComposeService, ServiceKind::Dockerfile) => {
+                    *existing = service;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(RepoScanError::DuplicateService { name: service.name });
+                }
+            },
+        }
     }
+
     services.insert(service.name.clone(), service);
     Ok(())
 }
@@ -479,12 +735,21 @@ fn collect_repo_files(
         message: format!("failed to read directory {}: {err}", root.display()),
     })?;
 
+    // specific skip list
+    let skip_dirs = ["node_modules", "target", "dist", "build", "vendor", "test"];
+
+
     for entry in entries {
         let entry = entry.map_err(|err| RepoScanError::Io {
             message: format!("failed to read directory entry: {err}"),
         })?;
         let path = entry.path();
         if path.is_dir() {
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if dir_name.starts_with('.') || skip_dirs.contains(&dir_name) {
+                // eprintln!("[scan_repo_basic] Skipping directory: {}", path.display());
+                continue;
+            }
             collect_repo_files(&path, dockerfiles, compose_files)?;
             continue;
         }

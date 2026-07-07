@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -33,6 +33,51 @@ impl Default for SshConfig {
             max_retries: 3,
             retry_delay: Duration::from_secs(2),
         }
+    }
+}
+
+impl SshConfig {
+    fn parse_env_u64(key: &str) -> Option<u64> {
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<u64>().ok())
+    }
+
+    fn parse_env_u32(key: &str) -> Option<u32> {
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<u32>().ok())
+    }
+
+    /// 从环境变量覆盖默认值（用于 CLI/UI 一致的生产级超时与重试策略）
+    ///
+    /// - `AGUS_SSH_CONNECT_TIMEOUT_SECS`
+    /// - `AGUS_SSH_COMMAND_TIMEOUT_SECS`
+    /// - `AGUS_SSH_MAX_RETRIES`
+    /// - `AGUS_SSH_RETRY_DELAY_MS`
+    pub fn from_env_or_default() -> Self {
+        let mut cfg = Self::default();
+        if let Some(secs) = Self::parse_env_u64("AGUS_SSH_CONNECT_TIMEOUT_SECS") {
+            if secs > 0 {
+                cfg.connect_timeout = Duration::from_secs(secs);
+            }
+        }
+        if let Some(secs) = Self::parse_env_u64("AGUS_SSH_COMMAND_TIMEOUT_SECS") {
+            if secs > 0 {
+                cfg.command_timeout = Duration::from_secs(secs);
+            }
+        }
+        if let Some(retries) = Self::parse_env_u32("AGUS_SSH_MAX_RETRIES") {
+            cfg.max_retries = retries.max(1);
+        }
+        if let Some(ms) = Self::parse_env_u64("AGUS_SSH_RETRY_DELAY_MS") {
+            cfg.retry_delay = Duration::from_millis(ms);
+        }
+        cfg
     }
 }
 
@@ -69,6 +114,34 @@ impl std::fmt::Display for SshError {
 }
 
 impl std::error::Error for SshError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ssh_config_from_env_or_default_overrides() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("AGUS_SSH_CONNECT_TIMEOUT_SECS", "3");
+        std::env::set_var("AGUS_SSH_COMMAND_TIMEOUT_SECS", "7");
+        std::env::set_var("AGUS_SSH_MAX_RETRIES", "5");
+        std::env::set_var("AGUS_SSH_RETRY_DELAY_MS", "1200");
+
+        let cfg = SshConfig::from_env_or_default();
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(3));
+        assert_eq!(cfg.command_timeout, Duration::from_secs(7));
+        assert_eq!(cfg.max_retries, 5);
+        assert_eq!(cfg.retry_delay, Duration::from_millis(1200));
+
+        std::env::remove_var("AGUS_SSH_CONNECT_TIMEOUT_SECS");
+        std::env::remove_var("AGUS_SSH_COMMAND_TIMEOUT_SECS");
+        std::env::remove_var("AGUS_SSH_MAX_RETRIES");
+        std::env::remove_var("AGUS_SSH_RETRY_DELAY_MS");
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SshControlConfig {
@@ -152,12 +225,81 @@ pub struct ProcessSshClient {
 impl ProcessSshClient {
     pub fn new() -> Self {
         Self {
-            config: SshConfig::default(),
+            config: SshConfig::from_env_or_default(),
         }
     }
 
     pub fn with_config(config: SshConfig) -> Self {
         Self { config }
+    }
+
+    fn run_command_with_timeout(
+        &self,
+        mut cmd: Command,
+        timeout: Duration,
+        label: &'static str,
+    ) -> Result<std::process::Output, SshError> {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| SshError::Connection {
+            message: format!("failed to launch {label}: {e}"),
+        })?;
+
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+
+        let stdout_handle = std::thread::spawn(move || -> Vec<u8> {
+            let mut buf = Vec::new();
+            if let Some(mut out) = stdout.take() {
+                let _ = out.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || -> Vec<u8> {
+            let mut buf = Vec::new();
+            if let Some(mut err) = stderr.take() {
+                let _ = err.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = stdout_handle.join().unwrap_or_default();
+                    let stderr = stderr_handle.join().unwrap_or_default();
+                    return Ok(std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+                Ok(None) => {
+                    if started.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stdout_handle.join();
+                        let _ = stderr_handle.join();
+                        return Err(SshError::Timeout {
+                            message: format!(
+                                "command execution timeout after {} seconds",
+                                timeout.as_secs()
+                            ),
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    return Err(SshError::Connection {
+                        message: format!("failed to wait for {label}: {e}"),
+                    });
+                }
+            }
+        }
     }
 
     fn execute_with_control(
@@ -376,16 +518,14 @@ impl ProcessSshClient {
         self.try_execute_with_control(target, command, control.as_ref())
     }
 
-    fn apply_ssh_options(
-        &self,
-        cmd: &mut Command,
-        target: &SshTarget,
-        control: Option<&SshControlConfig>,
-        batch_mode: bool,
-    ) {
-        if batch_mode {
-            cmd.arg("-o").arg("BatchMode=yes");
+    fn control_master_active(&self, target: &SshTarget, control: &SshControlConfig) -> bool {
+        if !control.path.exists() {
+            return false;
         }
+        let destination = format!("{}@{}", target.user, target.host);
+        let mut cmd = Command::new("ssh");
+
+        // 添加SSH选项
         cmd.arg("-o")
             .arg("StrictHostKeyChecking=accept-new")
             .arg("-o")
@@ -394,26 +534,14 @@ impl ProcessSshClient {
                 self.config.connect_timeout.as_secs()
             ))
             .arg("-p")
-            .arg(target.port.to_string());
-        if let Some(control) = control {
-            if let Some(path) = control.path.to_str() {
-                cmd.arg("-o")
-                    .arg("ControlMaster=auto")
-                    .arg("-o")
-                    .arg(format!("ControlPersist={}s", control.persist.as_secs()))
-                    .arg("-o")
-                    .arg(format!("ControlPath={}", path));
-            }
-        }
-    }
+            .arg(target.port.to_string())
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg(format!("ControlPersist={}s", control.persist.as_secs()))
+            .arg("-o")
+            .arg(format!("ControlPath={}", control.path.to_string_lossy()));
 
-    fn control_master_active(&self, target: &SshTarget, control: &SshControlConfig) -> bool {
-        if !control.path.exists() {
-            return false;
-        }
-        let destination = format!("{}@{}", target.user, target.host);
-        let mut cmd = Command::new("ssh");
-        self.apply_ssh_options(&mut cmd, target, Some(control), true);
         if let Some(ref identity) = target.identity_file {
             cmd.arg("-i").arg(identity);
         }
@@ -435,11 +563,49 @@ impl ProcessSshClient {
             })?;
             let mut cmd = Command::new(&sshpass_path);
             cmd.arg("-p").arg(password).arg("ssh");
-            self.apply_ssh_options(&mut cmd, target, Some(control), false);
+
+            // 添加SSH选项
+            cmd.arg("-o")
+                .arg("PreferredAuthentications=password")
+                .arg("-o")
+                .arg("NumberOfPasswordPrompts=1")
+                .arg("-o")
+                .arg("StrictHostKeyChecking=accept-new")
+                .arg("-o")
+                .arg(format!(
+                    "ConnectTimeout={}",
+                    self.config.connect_timeout.as_secs()
+                ))
+                .arg("-p")
+                .arg(target.port.to_string())
+                .arg("-o")
+                .arg("ControlMaster=auto")
+                .arg("-o")
+                .arg(format!("ControlPersist={}s", control.persist.as_secs()))
+                .arg("-o")
+                .arg(format!("ControlPath={}", control.path.to_string_lossy()));
+
             cmd
         } else {
             let mut cmd = Command::new("ssh");
-            self.apply_ssh_options(&mut cmd, target, Some(control), true);
+
+            // 添加SSH选项
+            cmd.arg("-o")
+                .arg("StrictHostKeyChecking=accept-new")
+                .arg("-o")
+                .arg(format!(
+                    "ConnectTimeout={}",
+                    self.config.connect_timeout.as_secs()
+                ))
+                .arg("-p")
+                .arg(target.port.to_string())
+                .arg("-o")
+                .arg("ControlMaster=auto")
+                .arg("-o")
+                .arg(format!("ControlPersist={}s", control.persist.as_secs()))
+                .arg("-o")
+                .arg(format!("ControlPath={}", control.path.to_string_lossy()));
+
             if let Some(ref identity) = target.identity_file {
                 cmd.arg("-i").arg(identity);
             }
@@ -532,37 +698,63 @@ impl ProcessSshClient {
             // 使用 sshpass 进行密码认证
             let mut cmd = Command::new(&sshpass_path);
             cmd.arg("-p").arg(password).arg("ssh");
-            self.apply_ssh_options(&mut cmd, target, control, false);
+
+            // 调试：记录ssh命令（不记录密码）
+            // Log reduced to avoid spam
+            // eprintln!(
+            //     "[SSH] 使用sshpass连接: {}@{}:{} (密码长度: {})",
+            //     target.user,
+            //     target.host,
+            //     target.port,
+            //     password.len()
+            // );
+
+            // 添加SSH选项
+            cmd.arg("-o")
+                .arg("PreferredAuthentications=password")
+                .arg("-o")
+                .arg("NumberOfPasswordPrompts=1")
+                .arg("-o")
+                .arg("StrictHostKeyChecking=accept-new")
+                .arg("-o")
+                .arg(format!(
+                    "ConnectTimeout={}",
+                    self.config.connect_timeout.as_secs()
+                ))
+                .arg("-p")
+                .arg(target.port.to_string());
+
+            // 如果有control配置，添加ControlMaster选项
+            if let Some(control) = control {
+                if let Some(path) = control.path.to_str() {
+                    cmd.arg("-o")
+                        .arg("ControlMaster=auto")
+                        .arg("-o")
+                        .arg(format!("ControlPersist={}s", control.persist.as_secs()))
+                        .arg("-o")
+                        .arg(format!("ControlPath={}", path));
+                }
+            }
+
             cmd.arg(&destination).arg(command);
 
-            // 使用超时控制执行命令
+            // 使用超时控制执行命令（超时后会 kill 子进程，避免“超时但仍卡死”）
             let timeout = self.config.command_timeout;
-            let (tx, rx) = std::sync::mpsc::channel();
-            let mut cmd_clone = cmd;
-            
-            let handle = std::thread::spawn(move || {
-                let output = cmd_clone.output();
-                let _ = tx.send(output);
-            });
-
-            let output = match rx.recv_timeout(timeout) {
-                Ok(Ok(output)) => output,
-                Ok(Err(err)) => {
-                    let _ = handle.join();
-                    let error_msg = if err.kind() == std::io::ErrorKind::NotFound {
-                        "sshpass is not installed. Please install it using: brew install hudochenkov/sshpass/sshpass (on macOS) or your system's package manager (on Linux)".to_string()
-                    } else {
-                        format!("failed to launch sshpass: {err}. Note: sshpass may need to be installed (brew install hudochenkov/sshpass/sshpass on macOS)")
-                    };
-                    return Err(SshError::Connection { message: error_msg });
+            let output = match self.run_command_with_timeout(cmd, timeout, "sshpass/ssh") {
+                Ok(output) => output,
+                Err(SshError::Connection { message }) => {
+                    // 兼容旧提示：sshpass 不存在时给出安装指引
+                    if message.contains("No such file")
+                        || message.contains("not found")
+                        || message.contains("failed to launch sshpass")
+                    {
+                        return Err(SshError::Connection {
+                            message: "sshpass is not installed. Please install it using: brew install hudochenkov/sshpass/sshpass (on macOS) or your system's package manager (on Linux)".to_string(),
+                        });
+                    }
+                    return Err(SshError::Connection { message });
                 }
-                Err(_) => {
-                    // 超时
-                    let _ = handle.join();
-                    return Err(SshError::Timeout {
-                        message: format!("command execution timeout after {} seconds", timeout.as_secs()),
-                    });
-                }
+                Err(other) => return Err(other),
             };
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -591,7 +783,29 @@ impl ProcessSshClient {
 
         // 使用密钥文件或系统默认密钥
         let mut cmd = Command::new("ssh");
-        self.apply_ssh_options(&mut cmd, target, control, true);
+
+        // 添加SSH选项（不使用batch mode，允许交互式输入）
+        cmd.arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg(format!(
+                "ConnectTimeout={}",
+                self.config.connect_timeout.as_secs()
+            ))
+            .arg("-p")
+            .arg(target.port.to_string());
+
+        // 如果有control配置，添加ControlMaster选项
+        if let Some(control) = control {
+            if let Some(path) = control.path.to_str() {
+                cmd.arg("-o")
+                    .arg("ControlMaster=auto")
+                    .arg("-o")
+                    .arg(format!("ControlPersist={}s", control.persist.as_secs()))
+                    .arg("-o")
+                    .arg(format!("ControlPath={}", path));
+            }
+        }
 
         // Add identity file if specified
         if let Some(ref identity) = target.identity_file {
@@ -600,32 +814,9 @@ impl ProcessSshClient {
 
         cmd.arg(&destination).arg(command);
 
-        // 使用超时控制执行命令
+        // 使用超时控制执行命令（超时后会 kill 子进程，避免“超时但仍卡死”）
         let timeout = self.config.command_timeout;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut cmd_clone = cmd;
-        
-        let handle = std::thread::spawn(move || {
-            let output = cmd_clone.output();
-            let _ = tx.send(output);
-        });
-
-        let output = match rx.recv_timeout(timeout) {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => {
-                let _ = handle.join();
-                return Err(SshError::Connection {
-                    message: format!("failed to launch ssh: {err}"),
-                });
-            }
-            Err(_) => {
-                // 超时
-                let _ = handle.join();
-                return Err(SshError::Timeout {
-                    message: format!("command execution timeout after {} seconds", timeout.as_secs()),
-                });
-            }
-        };
+        let output = self.run_command_with_timeout(cmd, timeout, "ssh")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -685,12 +876,62 @@ impl ProcessSshClient {
 
             let mut cmd = Command::new(&sshpass_path);
             cmd.arg("-p").arg(password).arg("ssh");
-            self.apply_ssh_options(&mut cmd, target, control, false);
+
+            // 添加SSH选项
+            cmd.arg("-o")
+                .arg("PreferredAuthentications=password")
+                .arg("-o")
+                .arg("NumberOfPasswordPrompts=1")
+                .arg("-o")
+                .arg("StrictHostKeyChecking=accept-new")
+                .arg("-o")
+                .arg(format!(
+                    "ConnectTimeout={}",
+                    self.config.connect_timeout.as_secs()
+                ))
+                .arg("-p")
+                .arg(target.port.to_string());
+
+            // 如果有control配置，添加ControlMaster选项
+            if let Some(control) = control {
+                if let Some(path) = control.path.to_str() {
+                    cmd.arg("-o")
+                        .arg("ControlMaster=auto")
+                        .arg("-o")
+                        .arg(format!("ControlPersist={}s", control.persist.as_secs()))
+                        .arg("-o")
+                        .arg(format!("ControlPath={}", path));
+                }
+            }
+
             cmd.arg(&destination).arg(command);
             cmd
         } else {
             let mut cmd = Command::new("ssh");
-            self.apply_ssh_options(&mut cmd, target, control, true);
+
+            // 添加SSH选项（不使用batch mode）
+            cmd.arg("-o")
+                .arg("StrictHostKeyChecking=accept-new")
+                .arg("-o")
+                .arg(format!(
+                    "ConnectTimeout={}",
+                    self.config.connect_timeout.as_secs()
+                ))
+                .arg("-p")
+                .arg(target.port.to_string());
+
+            // 如果有control配置，添加ControlMaster选项
+            if let Some(control) = control {
+                if let Some(path) = control.path.to_str() {
+                    cmd.arg("-o")
+                        .arg("ControlMaster=auto")
+                        .arg("-o")
+                        .arg(format!("ControlPersist={}s", control.persist.as_secs()))
+                        .arg("-o")
+                        .arg(format!("ControlPath={}", path));
+                }
+            }
+
             if let Some(ref identity) = target.identity_file {
                 cmd.arg("-i").arg(identity);
             }

@@ -3,13 +3,21 @@ use std::path::PathBuf;
 
 use agus_cli_core::{admin, audit, CliError};
 use agus_secret_store::create_secret_store;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Table,
+    Json,
+}
 
 #[derive(Parser)]
 #[command(name = "asda")]
 #[command(about = "Agus admin CLI", long_about = None)]
 struct AsdaCli {
+    #[arg(long, default_value = "table", value_enum)]
+    format: OutputFormat,
     #[command(subcommand)]
     command: AsdaCommand,
 }
@@ -119,47 +127,70 @@ enum SecretsSubcommand {
 }
 
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(exit_code_from_error(&err));
+        }
     }
 }
 
-fn run() -> Result<(), CliError> {
+fn run() -> Result<i32, CliError> {
     let cli = AsdaCli::parse();
     match cli.command {
         AsdaCommand::Admin(cmd) => match cmd.command {
-            AdminSubcommand::Set { user, password_env } => admin_set(user, password_env),
-            AdminSubcommand::Status => admin_status(),
-            AdminSubcommand::Reset => admin_reset(),
+            AdminSubcommand::Set { user, password_env } => admin_set(user, password_env).map(|_| 0),
+            AdminSubcommand::Status => admin_status(cli.format).map(|_| 0),
+            AdminSubcommand::Reset => admin_reset().map(|_| 0),
         },
         AsdaCommand::Audit(cmd) => match cmd.command {
-            AuditSubcommand::Export { category, out } => audit_export(category, out),
-            AuditSubcommand::Stats => audit_stats(),
+            AuditSubcommand::Export { category, out } => audit_export(category, out).map(|_| 0),
+            AuditSubcommand::Stats => audit_stats(cli.format).map(|_| 0),
         },
         AsdaCommand::Config(cmd) => match cmd.command {
-            ConfigSubcommand::Show => config_show(),
-            ConfigSubcommand::Set(cmd) => config_set(cmd),
-            ConfigSubcommand::SetLlm(cmd) => config_set_llm(cmd),
+            ConfigSubcommand::Show => config_show().map(|_| 0),
+            ConfigSubcommand::Set(cmd) => config_set(cmd).map(|_| 0),
+            ConfigSubcommand::SetLlm(cmd) => config_set_llm(cmd).map(|_| 0),
         },
         AsdaCommand::Secrets(cmd) => match cmd.command {
-            SecretsSubcommand::List => secrets_list(),
-            SecretsSubcommand::Get { key } => secrets_get(&key),
+            SecretsSubcommand::List => secrets_list(cli.format).map(|_| 0),
+            SecretsSubcommand::Get { key } => secrets_get(&key).map(|_| 0),
             SecretsSubcommand::Set {
                 key,
                 value,
                 value_env,
-            } => secrets_set(&key, value, value_env),
-            SecretsSubcommand::Delete { key } => secrets_delete(&key),
+            } => secrets_set(&key, value, value_env).map(|_| 0),
+            SecretsSubcommand::Delete { key } => secrets_delete(&key).map(|_| 0),
             SecretsSubcommand::Rotate {
                 key,
                 value,
                 value_env,
                 keep_old,
-            } => secrets_rotate(&key, value, value_env, keep_old),
-            SecretsSubcommand::Versions { key } => secrets_versions(&key),
+            } => secrets_rotate(&key, value, value_env, keep_old).map(|_| 0),
+            SecretsSubcommand::Versions { key } => secrets_versions(&key).map(|_| 0),
         },
-        AsdaCommand::Unlock => admin_unlock(),
+        AsdaCommand::Unlock => admin_unlock().map(|_| 0),
+    }
+}
+
+fn exit_code_from_error(err: &CliError) -> i32 {
+    match err {
+        CliError::InvalidInput(message) => {
+            if message.to_lowercase().contains("not found") {
+                4
+            } else {
+                2
+            }
+        }
+        CliError::AdminMissing | CliError::AuthFailed => 3,
+        CliError::Config(_) => 2,
+        CliError::Ssh(ssh) => match ssh {
+            agus_ssh::SshError::Timeout { .. } => 124,
+            agus_ssh::SshError::Connection { .. } => 10,
+            agus_ssh::SshError::Command { .. } => 11,
+        },
+        CliError::Storage(_) | CliError::Io(_) | CliError::Json(_) => 1,
     }
 }
 
@@ -195,11 +226,18 @@ fn admin_set(user: Option<String>, password_env: Option<String>) -> Result<(), C
     Ok(())
 }
 
-fn admin_status() -> Result<(), CliError> {
+fn admin_status(format: OutputFormat) -> Result<(), CliError> {
     let config = admin::load_admin_config()?;
     match config {
         Some(cfg) => {
-            println!("Admin configured: {}", cfg.username);
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&cfg)?);
+                }
+                OutputFormat::Table => {
+                    println!("Admin configured: {}", cfg.username);
+                }
+            }
         }
         None => {
             println!("Admin not configured.");
@@ -268,9 +306,10 @@ fn audit_export(category: Option<String>, out: Option<String>) -> Result<(), Cli
     Ok(())
 }
 
-fn audit_stats() -> Result<(), CliError> {
+fn audit_stats(format: OutputFormat) -> Result<(), CliError> {
     let base = agus_cli_core::config::agus_home()?;
     let log_dir = base.join("logs");
+    let mut collected: Vec<serde_json::Value> = Vec::new();
     for category in ["system", "behavior"] {
         let dir = log_dir.join(category);
         if !dir.exists() {
@@ -295,14 +334,29 @@ fn audit_stats() -> Result<(), CliError> {
             }
         }
         if let Some((path, size, mtime)) = latest {
-            println!(
-                "{}\t{}\t{:.2}MB\t{}",
-                category,
-                path.display(),
-                (size as f64) / (1024.0 * 1024.0),
-                mtime
-            );
+            match format {
+                OutputFormat::Json => {
+                    collected.push(serde_json::json!({
+                        "category": category,
+                        "path": path.to_string_lossy().to_string(),
+                        "size_mb": (size as f64) / (1024.0 * 1024.0),
+                        "last_modified": mtime,
+                    }));
+                }
+                OutputFormat::Table => {
+                    println!(
+                        "{}\t{}\t{:.2}MB\t{}",
+                        category,
+                        path.display(),
+                        (size as f64) / (1024.0 * 1024.0),
+                        mtime
+                    );
+                }
+            }
         }
+    }
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&collected)?);
     }
     Ok(())
 }
@@ -368,12 +422,19 @@ fn config_set_llm(cmd: ConfigSetLlmCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn secrets_list() -> Result<(), CliError> {
+fn secrets_list(format: OutputFormat) -> Result<(), CliError> {
     let store = create_secret_store();
     match store.list_secrets() {
         Ok(keys) => {
-            for key in keys {
-                println!("{key}");
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&keys)?);
+                }
+                OutputFormat::Table => {
+                    for key in keys {
+                        println!("{key}");
+                    }
+                }
             }
             Ok(())
         }

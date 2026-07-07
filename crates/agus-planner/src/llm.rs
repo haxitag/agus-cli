@@ -16,7 +16,12 @@ pub enum LlmProviderType {
     OpenRouter,
     AlibabaQwen,
     DeepSeek,
+    MinMAX,
     Zhipu,
+    /// 阿里云百炼 DashScope（compatible-mode，支持多模态）
+    DashScope,
+    /// NVIDIA NIM API（integrate.api.nvidia.com）
+    NvidiaNim,
 }
 
 #[derive(Debug, Clone)]
@@ -142,7 +147,7 @@ pub struct DeploymentPlanDraft {
 pub struct DeploymentStepDraft {
     pub id: String,
     pub service_name: String,
-    pub action: String, // "deploy", "verify", "rollback"
+    pub action: String, // "DeployService" | "VerifyService"
     pub description: String,
     pub command: String,
     pub depends_on: Vec<String>,
@@ -156,6 +161,54 @@ pub struct DryRunAnalysis {
     pub simulated_steps: Vec<String>,
     pub potential_issues: Vec<String>,
     pub recommendations: Vec<String>,
+}
+
+// ========== 环境扫描报告分析 ==========
+
+/// 扫描报告分析结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanReportAnalysis {
+    pub executive_summary: String,           // 执行摘要
+    pub environment_assessment: String,      // 环境评估
+    pub security_analysis: String,           // 安全分析
+    pub resource_utilization: String,        // 资源利用分析
+    pub alignment_analysis: String,          // 对齐状态分析
+    pub risk_assessment: Vec<String>,        // 风险评估
+    pub action_recommendations: Vec<String>, // 行动建议
+    pub priority_actions: Vec<String>,       // 优先级行动
+}
+
+/// 扫描报告上下文
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanReportContext {
+    pub project_name: String,
+    pub host_address: String,
+    pub host_user: String,
+    pub scanned_at: String,
+    pub repo_graph: Option<ServiceDependencyGraph>,
+    pub docker_images: Vec<DockerImageSummary>,
+    pub docker_containers: Vec<DockerContainerSummary>,
+    pub warnings: Vec<String>,
+    pub alignment_suggestions: Vec<String>,
+}
+
+/// Docker镜像摘要
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerImageSummary {
+    pub repository: String,
+    pub tag: String,
+    pub id: String,
+    pub created_at: String,
+    pub size: String,
+}
+
+/// Docker容器摘要
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerContainerSummary {
+    pub name: String,
+    pub image: String,
+    pub status: String,
+    pub ports: String,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +315,18 @@ pub trait LlmProvider: Send + Sync {
         let prompt = crate::llm::build_deployment_plan_prompt(context)?;
         let response = self.complete_prompt(&prompt)?;
         crate::llm::parse_llm_plan_response(&response)
+    }
+
+    /// Generate scan report analysis based on scan results
+    /// 环境扫描报告分析 - LLM 调用
+    fn generate_scan_report_analysis(
+        &self,
+        context: &ScanReportContext,
+    ) -> Result<ScanReportAnalysis, LlmError> {
+        // Default implementation uses complete_prompt
+        let prompt = crate::llm::build_scan_report_prompt(context)?;
+        let response = self.complete_prompt(&prompt)?;
+        crate::llm::parse_scan_report_response(&response)
     }
 }
 
@@ -3072,22 +3137,44 @@ pub fn create_llm_provider(config: LlmConfig) -> Result<Box<dyn LlmProvider>, Ll
                 .unwrap_or_else(|| "https://api.deepseek.com/v1/chat/completions".to_string());
             Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
         }
+        LlmProviderType::MinMAX => {
+            // MinMAX is OpenAI compatible
+            let api_url = config.base_url.clone().unwrap_or_else(|| {
+                "https://api.minimax.chat/v1/text/chatcompletion_v2".to_string()
+            });
+            Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
+        }
         LlmProviderType::Zhipu => Ok(Box::new(ZhipuLlmProvider::new(config))),
+        LlmProviderType::DashScope => {
+            let api_url = config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| {
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string()
+                });
+            Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
+        }
+        LlmProviderType::NvidiaNim => {
+            let api_url = config.base_url.clone().unwrap_or_else(|| {
+                "https://integrate.api.nvidia.com/v1/chat/completions".to_string()
+            });
+            Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
+        }
     }
 }
 
 // P0-2: 部署计划制定 - Prompt 构建和响应解析
 
 /// 构建部署计划制定的 Prompt
-pub fn build_deployment_plan_prompt(
-    context: &DeploymentPlanContext,
-) -> Result<String, LlmError> {
-    let graph_json = serde_json::to_string_pretty(&context.dependency_graph)
-        .map_err(|e| LlmError::ConfigError {
+pub fn build_deployment_plan_prompt(context: &DeploymentPlanContext) -> Result<String, LlmError> {
+    let graph_json = serde_json::to_string_pretty(&context.dependency_graph).map_err(|e| {
+        LlmError::ConfigError {
             message: format!("Failed to serialize dependency graph: {}", e),
-        })?;
+        }
+    })?;
 
-    let prompt = format!(r#"
+    let prompt = format!(
+        r#"
 # 角色定义
 你是一位资深的 DevOps/SRE 工程师，负责制定可靠的部署计划。
 
@@ -3131,7 +3218,7 @@ pub fn build_deployment_plan_prompt(
       {{
         "id": "step_1",
         "service_name": "database",
-        "action": "deploy",
+        "action": "DeployService",
         "description": "部署数据库服务",
         "command": "docker-compose up -d database",
         "depends_on": [],
@@ -3175,6 +3262,7 @@ pub fn build_deployment_plan_prompt(
 3. 必须提供回滚方案
 4. 必须考虑资源限制
 5. 必须考虑最小化服务中断时间
+6. `action` 字段必须是 `DeployService` 或 `VerifyService`（首字母大写，符合枚举值）
 
 # 输出格式
 
@@ -3203,6 +3291,107 @@ pub fn build_deployment_plan_prompt(
     Ok(prompt)
 }
 
+/// 构建环境扫描报告分析的 Prompt
+pub fn build_scan_report_prompt(context: &ScanReportContext) -> Result<String, LlmError> {
+    let graph_json = match &context.repo_graph {
+        Some(graph) => serde_json::to_string_pretty(graph).map_err(|e| LlmError::ConfigError {
+            message: format!("Failed to serialize dependency graph: {}", e),
+        })?,
+        None => "null".to_string(),
+    };
+
+    let images_json =
+        serde_json::to_string_pretty(&context.docker_images).map_err(|e| LlmError::ConfigError {
+            message: format!("Failed to serialize docker images: {}", e),
+        })?;
+    let containers_json =
+        serde_json::to_string_pretty(&context.docker_containers).map_err(|e| {
+            LlmError::ConfigError {
+                message: format!("Failed to serialize docker containers: {}", e),
+            }
+        })?;
+    let warnings_json =
+        serde_json::to_string_pretty(&context.warnings).map_err(|e| LlmError::ConfigError {
+            message: format!("Failed to serialize warnings: {}", e),
+        })?;
+    let alignment_json = serde_json::to_string_pretty(&context.alignment_suggestions).map_err(
+        |e| LlmError::ConfigError {
+            message: format!("Failed to serialize alignment suggestions: {}", e),
+        },
+    )?;
+
+    let prompt = format!(
+        r#"
+# 角色定义
+你是一位资深的 SRE/安全与平台工程师，负责输出“环境扫描报告”的高质量分析。
+
+# 任务目标
+基于扫描结果，输出一份结构化分析，覆盖环境评估、安全风险、资源利用、对齐状态与行动建议。
+
+# 输入信息
+
+## 1. 项目与主机信息
+- 项目名称: {}
+- 主机地址: {}
+- 主机用户: {}
+- 扫描时间: {}
+
+## 2. 服务依赖图 (可能为空)
+```json
+{}
+```
+
+## 3. Docker 镜像摘要
+```json
+{}
+```
+
+## 4. Docker 容器摘要
+```json
+{}
+```
+
+## 5. 扫描告警 / 风险提示
+```json
+{}
+```
+
+## 6. 对齐与优化建议 (自动生成)
+```json
+{}
+```
+
+# 输出要求
+
+请严格输出 JSON 格式，包含以下字段：
+
+{{
+  "executive_summary": "执行摘要（2-5句话，突出关键风险与总体健康度）",
+  "environment_assessment": "环境评估（操作系统/运行态/基础组件）",
+  "security_analysis": "安全分析（漏洞暴露、配置风险、权限与合规）",
+  "resource_utilization": "资源利用分析（CPU/内存/磁盘/网络）",
+  "alignment_analysis": "对齐状态分析（与最佳实践/标准的偏差）",
+  "risk_assessment": ["风险点1", "风险点2"],
+  "action_recommendations": ["建议1", "建议2"],
+  "priority_actions": ["优先级最高的行动1", "行动2"]
+}}
+
+注意：只输出 JSON，不要 Markdown。
+"#,
+        context.project_name,
+        context.host_address,
+        context.host_user,
+        context.scanned_at,
+        graph_json,
+        images_json,
+        containers_json,
+        warnings_json,
+        alignment_json,
+    );
+
+    Ok(prompt)
+}
+
 /// 从 LLM 响应中提取 JSON
 fn extract_json_from_response(response: &str) -> String {
     // 尝试提取 ```json ... ``` 代码块
@@ -3211,7 +3400,7 @@ fn extract_json_from_response(response: &str) -> String {
             return response[start + 7..start + end].trim().to_string();
         }
     }
-    
+
     // 尝试提取 ``` ... ``` 代码块（可能是 markdown 代码块）
     if let Some(start) = response.find("```") {
         if let Some(end) = response[start + 3..].find("```") {
@@ -3221,32 +3410,103 @@ fn extract_json_from_response(response: &str) -> String {
             }
         }
     }
-    
+
     // 尝试提取 {...} JSON 对象
     if let Some(start) = response.find('{') {
         if let Some(end) = response.rfind('}') {
             return response[start..=end].to_string();
         }
     }
-    
+
     response.to_string()
 }
 
 /// 解析 LLM 返回的部署计划响应
-pub fn parse_llm_plan_response(
-    response: &str,
-) -> Result<LLMDeploymentPlanResponse, LlmError> {
+pub fn parse_llm_plan_response(response: &str) -> Result<LLMDeploymentPlanResponse, LlmError> {
     let json_str = extract_json_from_response(response);
-    
-    let plan: LLMDeploymentPlanResponse = serde_json::from_str(&json_str)
-        .map_err(|e| LlmError::ConfigError {
-            message: format!("Failed to parse LLM response: {}. Response: {}", e, json_str),
+
+    let plan: LLMDeploymentPlanResponse =
+        serde_json::from_str(&json_str).map_err(|e| LlmError::ConfigError {
+            message: format!(
+                "Failed to parse LLM response: {}. Response: {}",
+                e, json_str
+            ),
         })?;
-    
+
     // 验证计划
     validate_llm_plan(&plan)?;
-    
+
     Ok(plan)
+}
+
+/// 解析 LLM 返回的扫描报告分析
+pub fn parse_scan_report_response(response: &str) -> Result<ScanReportAnalysis, LlmError> {
+    let json_str = extract_json_from_response(response);
+
+    match serde_json::from_str::<ScanReportAnalysis>(&json_str) {
+        Ok(analysis) => Ok(analysis),
+        Err(parse_err) => {
+            // 尝试宽松解析，避免字段缺失导致整体失败
+            let value: serde_json::Value = serde_json::from_str(&json_str).map_err(|_| {
+                LlmError::ParseError {
+                    message: format!(
+                        "Failed to parse scan report analysis: {}. Response: {}",
+                        parse_err, json_str
+                    ),
+                }
+            })?;
+
+            let get_string = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let get_vec = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default()
+            };
+
+            let analysis = ScanReportAnalysis {
+                executive_summary: get_string("executive_summary"),
+                environment_assessment: get_string("environment_assessment"),
+                security_analysis: get_string("security_analysis"),
+                resource_utilization: get_string("resource_utilization"),
+                alignment_analysis: get_string("alignment_analysis"),
+                risk_assessment: get_vec("risk_assessment"),
+                action_recommendations: get_vec("action_recommendations"),
+                priority_actions: get_vec("priority_actions"),
+            };
+
+            let all_empty = analysis.executive_summary.is_empty()
+                && analysis.environment_assessment.is_empty()
+                && analysis.security_analysis.is_empty()
+                && analysis.resource_utilization.is_empty()
+                && analysis.alignment_analysis.is_empty()
+                && analysis.risk_assessment.is_empty()
+                && analysis.action_recommendations.is_empty()
+                && analysis.priority_actions.is_empty();
+
+            if all_empty {
+                return Err(LlmError::ParseError {
+                    message: format!(
+                        "Failed to parse scan report analysis: {}. Response: {}",
+                        parse_err, json_str
+                    ),
+                });
+            }
+
+            Ok(analysis)
+        }
+    }
 }
 
 /// 验证 LLM 生成的部署计划
@@ -3257,7 +3517,7 @@ fn validate_llm_plan(plan: &LLMDeploymentPlanResponse) -> Result<(), LlmError> {
             message: "Deployment plan has no steps".to_string(),
         });
     }
-    
+
     // 检查步骤 ID 是否唯一
     let mut step_ids = std::collections::HashSet::new();
     for step in &plan.deployment_plan.steps {
@@ -3268,7 +3528,7 @@ fn validate_llm_plan(plan: &LLMDeploymentPlanResponse) -> Result<(), LlmError> {
         }
         step_ids.insert(step.id.clone());
     }
-    
+
     // 检查依赖关系是否有效
     for step in &plan.deployment_plan.steps {
         for dep in &step.depends_on {
@@ -3279,6 +3539,6 @@ fn validate_llm_plan(plan: &LLMDeploymentPlanResponse) -> Result<(), LlmError> {
             }
         }
     }
-    
+
     Ok(())
 }

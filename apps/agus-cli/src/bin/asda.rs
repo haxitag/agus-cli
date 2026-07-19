@@ -119,6 +119,7 @@ enum SecretsSubcommand {
         key: String,
         value: Option<String>,
         value_env: Option<String>,
+        #[arg(long, default_value_t = false)]
         keep_old: bool,
     },
     Versions {

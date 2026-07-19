@@ -4,8 +4,10 @@ pub mod config;
 pub mod context;
 pub mod exec;
 pub mod executions;
+pub mod forge_handoff;
 pub mod hosts;
 pub mod plan;
+pub mod projects;
 pub mod risk;
 
 use thiserror::Error;

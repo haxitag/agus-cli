@@ -3,6 +3,7 @@ members = [
   "apps/agus-cli",
   "apps/agus-ui/src-tauri",
   "crates/agus-cli-core",
+  "crates/agus-forge-handoff",
   "crates/agus-core-domain",
   "crates/agus-secret-store",
   "crates/agus-ssh",

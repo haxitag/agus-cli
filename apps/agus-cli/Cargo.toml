@@ -1,10 +1,11 @@
 [package]
 name = "agus-cli"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]
 agus-cli-core = { path = "../../crates/agus-cli-core" }
+agus-forge-handoff = { path = "../../crates/agus-forge-handoff" }
 agus-executor = { path = "../../crates/agus-executor" }
 agus-observer = { path = "../../crates/agus-observer" }
 agus-planner = { path = "../../crates/agus-planner" }

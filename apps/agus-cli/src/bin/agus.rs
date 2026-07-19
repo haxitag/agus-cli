@@ -6,11 +6,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agus_cli_core::{admin, audit, context, exec, executions, hosts, plan, risk, CliError};
-use agus_core_domain::{
-    DeploymentAction, DeploymentPlan, Environment, ExecutionRecord, ExecutionStatus, Host,
-    HostContext, OpsEvent,
+use agus_cli_core::{
+    admin, audit, context, exec, executions, hosts, plan, projects, risk, CliError,
 };
+use agus_core_domain::{
+    DeploymentAction, DeploymentPlan, DeploymentStep, Environment, ExecutionRecord, ExecutionStatus,
+    Host, HostContext, OpsEvent,
+};
+use agus_forge_handoff::handoff_plan_memo;
 use agus_executor::{log_stream, ExecutionSession, Executor};
 use agus_observer::{
     collect_system_metrics, container_health, container_logs, scan_junk_files, scan_nginx_status,
@@ -58,6 +61,8 @@ enum AgusCommand {
     Shell(ShellCommand),
     #[command(subcommand)]
     Plan(PlanCommand),
+    #[command(subcommand)]
+    Project(ProjectCommand),
     #[command(subcommand)]
     Deploy(DeployCommand),
     #[command(subcommand)]
@@ -173,6 +178,28 @@ enum PlanCommand {
     Show(PlanShowCommand),
     Dag(PlanDagCommand),
     Update(PlanUpdateCommand),
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Upsert LocalProject from Forge forge_ops_handoff.json
+    Upsert(ProjectUpsertCommand),
+    List,
+}
+
+#[derive(Args)]
+struct ProjectUpsertCommand {
+    /// Path to forge_ops_handoff.json or egg repo root containing docs/ops/deploy/forge_ops_handoff.json
+    #[arg(long = "from-handoff")]
+    from_handoff: String,
+    /// Override default Host id
+    #[arg(long)]
+    host: Option<String>,
+    /// Write stub build.sh / deploy.dev.sh / deploy.prod.sh when missing
+    #[arg(long)]
+    write_scripts: bool,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -492,6 +519,7 @@ fn handle_command(command: AgusCommand, format: OutputFormat) -> Result<i32, Cli
         AgusCommand::Ssh(cmd) => handle_ssh(cmd).map(|_| 0),
         AgusCommand::Shell(cmd) => handle_shell(cmd).map(|_| 0),
         AgusCommand::Plan(cmd) => handle_plan(cmd).map(|_| 0),
+        AgusCommand::Project(cmd) => handle_project(cmd).map(|_| 0),
         AgusCommand::Deploy(cmd) => handle_deploy(cmd, format).map(|_| 0),
         AgusCommand::Logs(cmd) => handle_logs(cmd).map(|_| 0),
         AgusCommand::Monitor(cmd) => handle_monitor(cmd).map(|_| 0),
@@ -798,13 +826,42 @@ fn shell_init(shell: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn handle_project(cmd: ProjectCommand) -> Result<(), CliError> {
+    match cmd {
+        ProjectCommand::List => {
+            let list = projects::load_projects()?;
+            println!("{}", serde_json::to_string_pretty(&list)?);
+            Ok(())
+        }
+        ProjectCommand::Upsert(cmd) => {
+            let result = projects::upsert_from_handoff(
+                Path::new(&cmd.from_handoff),
+                cmd.host.as_deref(),
+                cmd.write_scripts,
+                cmd.dry_run,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+    }
+}
+
 fn handle_plan(cmd: PlanCommand) -> Result<(), CliError> {
     match cmd {
         PlanCommand::Generate(cmd) => {
             let repo_path = PathBuf::from(&cmd.repo);
+            let handoff = projects::load_handoff_for_repo(&repo_path)?;
+            if let Some(ref h) = handoff {
+                eprintln!(
+                    "forge_ops_handoff: project={} suggested_env={} tier={}",
+                    h.project.project_id,
+                    h.delivery.suggested_environment,
+                    h.delivery.delivery_tier
+                );
+            }
             let graph = scan_repo_basic(&repo_path)
                 .map_err(|e| CliError::InvalidInput(format!("scan repo failed: {e}")))?;
-            let plan = if cmd.llm {
+            let mut plan = if cmd.llm {
                 let config = load_llm_config()?;
                 let provider = llm::create_llm_provider(config)
                     .map_err(|e| CliError::Config(format!("failed to create LLM provider: {e}")))?;
@@ -814,6 +871,38 @@ fn handle_plan(cmd: PlanCommand) -> Result<(), CliError> {
                 generate_deployment_plan(&graph)
                     .map_err(|e| CliError::InvalidInput(format!("plan generation failed: {e}")))?
             };
+
+            if let Some(h) = handoff.as_ref() {
+                let memo = handoff_plan_memo(h);
+                if let Some(first) = plan.steps.first_mut() {
+                    first.memo = Some(match first.memo.take() {
+                        Some(existing) => format!("{memo}\n{existing}"),
+                        None => memo.clone(),
+                    });
+                } else {
+                    // No docker services: still emit a review step from handoff
+                    let start = h.entrypoints.start.clone().unwrap_or_else(|| "./start.sh".into());
+                    plan.steps.push(DeploymentStep {
+                        id: "forge-handoff:review".into(),
+                        service_name: h.project.project_id.clone(),
+                        action: DeploymentAction::RunSshCommand {
+                            command: format!("echo {memo:?}; test -x {start} || true"),
+                        },
+                        depends_on: vec![],
+                        approval_required: true,
+                        memo: Some(memo),
+                    });
+                }
+                if h.scripts_agus.build.is_none()
+                    || h.scripts_agus.deploy_dev.is_none()
+                    || h.scripts_agus.deploy_prod.is_none()
+                {
+                    eprintln!(
+                        "hint: scripts_agus incomplete — run: agus project upsert --from-handoff {} --write-scripts",
+                        repo_path.join("docs/ops/deploy/forge_ops_handoff.json").display()
+                    );
+                }
+            }
 
             if let Some(output) = cmd.output.as_deref() {
                 plan::save_plan(output, &plan)?;

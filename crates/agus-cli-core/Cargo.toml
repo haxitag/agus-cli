@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 agus-core-domain = { path = "../agus-core-domain" }
+agus-forge-handoff = { path = "../agus-forge-handoff" }
 agus-ssh = { path = "../agus-ssh" }
 agus-storage = { path = "../agus-storage" }
 argon2 = "0.5"

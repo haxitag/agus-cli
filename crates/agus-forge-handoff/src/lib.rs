@@ -525,18 +525,30 @@ pub fn handoff_plan_memo(handoff: &ForgeOpsHandoff) -> String {
 }
 
 /// Stub shell scripts when missing (no secrets).
+/// Marked with `AGUS_SCRIPT_KIND=stub` so Agus can detect placeholders and refuse silent “success”.
 pub fn default_stub_scripts(project_id: &str, start: Option<&str>) -> (String, String, String) {
     let start_cmd = start.unwrap_or("./start.sh");
     let build = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\n# Agus stub from Forge handoff ({project_id})\necho \"[build] stub — replace with real build\"\nif [ -f Dockerfile ]; then docker build -t {project_id}:latest .; fi\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\n# AGUS_SCRIPT_KIND=stub\n# Agus stub from Forge handoff ({project_id})\necho \"[build] stub — replace with real build\" >&2\nexit 1\n"
     );
     let deploy_dev = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\n# Agus stub deploy.dev ({project_id})\necho \"[deploy.dev] stub — review before prod\"\n# {start_cmd}\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\n# AGUS_SCRIPT_KIND=stub\n# Agus stub deploy.dev ({project_id})\necho \"[deploy.dev] stub — replace before deploy; intended start: {start_cmd}\" >&2\nexit 1\n"
     );
     let deploy_prod = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\n# Agus stub deploy.prod ({project_id})\necho \"[deploy.prod] stub — requires approval\"\nexit 1\n"
+        "#!/usr/bin/env bash\nset -euo pipefail\n# AGUS_SCRIPT_KIND=stub\n# Agus stub deploy.prod ({project_id})\necho \"[deploy.prod] stub — requires real script + approval\" >&2\nexit 1\n"
     );
     (build, deploy_dev, deploy_prod)
+}
+
+/// Detect Agus-generated placeholder deploy/build scripts (current + legacy markers).
+pub fn is_agus_stub_script(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    content.contains("AGUS_SCRIPT_KIND=stub")
+        || content.contains("# Agus stub")
+        || lower.contains("agus stub from forge")
+        || lower.contains("[build] stub")
+        || lower.contains("[deploy.dev] stub")
+        || lower.contains("[deploy.prod] stub")
 }
 
 #[cfg(test)]
@@ -590,6 +602,18 @@ mod tests {
     fn rejects_markdown() {
         let err = parse_handoff_json("# title\n").unwrap_err();
         assert!(matches!(err, HandoffError::Invalid(_)));
+    }
+
+    #[test]
+    fn stub_scripts_are_detectable_and_fail_closed() {
+        let (build, deploy_dev, deploy_prod) = default_stub_scripts("demo", Some("./start.sh"));
+        assert!(is_agus_stub_script(&build));
+        assert!(is_agus_stub_script(&deploy_dev));
+        assert!(is_agus_stub_script(&deploy_prod));
+        assert!(build.contains("exit 1"));
+        assert!(deploy_dev.contains("exit 1"));
+        assert!(deploy_prod.contains("exit 1"));
+        assert!(!is_agus_stub_script("#!/bin/bash\ndocker compose up -d\n"));
     }
 
     #[test]

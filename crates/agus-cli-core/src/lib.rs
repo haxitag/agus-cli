@@ -4,11 +4,15 @@ pub mod config;
 pub mod context;
 pub mod exec;
 pub mod executions;
+pub mod finalshell;
 pub mod forge_handoff;
+pub mod host_password;
 pub mod hosts;
 pub mod plan;
 pub mod projects;
 pub mod risk;
+pub mod shortcuts;
+pub mod terminal_history;
 
 use thiserror::Error;
 

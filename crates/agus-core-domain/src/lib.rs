@@ -86,6 +86,9 @@ pub struct Host {
     pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub group_id: Option<String>,
+    /// Optional HTTP(S) health URL for SLA probing (in addition to TCP SSH port).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub health_check_url: Option<String>,
 }
 
 fn default_ssh_user() -> String {

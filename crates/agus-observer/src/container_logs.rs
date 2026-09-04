@@ -100,14 +100,15 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
         _since: Option<u64>,
         _until: Option<u64>,
     ) -> Result<(), ContainerLogError> {
-        // Implementation would start a background task to monitor logs
-        // For now, this is a placeholder
-        Ok(())
+        Err(ContainerLogError::SshError {
+            message: "持续日志监控未实现：请使用 get_logs / 一次性拉取，勿假装已启动监控".to_string(),
+        })
     }
 
     fn stop_monitoring(&self, _container_id: &str) -> Result<(), ContainerLogError> {
-        // Implementation would stop the background monitoring task
-        Ok(())
+        Err(ContainerLogError::SshError {
+            message: "持续日志监控未实现：无后台监控任务可停止".to_string(),
+        })
     }
 
     fn get_logs(
@@ -155,11 +156,37 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
     where
         F: Fn(ContainerLogEntry) + Send + Sync + 'static,
     {
-        // This would start a background task that continuously reads logs
-        // For now, this is a placeholder that gets recent logs
-        let logs = self.get_logs(container_id, Some(100), None)?;
-        for entry in logs {
-            callback(entry);
+        // 非持续流：有界 follow（最多约 20s），避免假装常驻 -f 监控。
+        // 优先 timeout(1)；若无 timeout 命令则退回一次性拉取。
+        let container_arg = escape_shell_arg(container_id);
+        let follow_cmd = format!(
+            "(command -v timeout >/dev/null 2>&1 && timeout 20s docker logs --tail=50 -f --timestamps -- {0} 2>&1) || docker logs --tail=100 --timestamps -- {0} 2>&1",
+            container_arg
+        );
+
+        let result = self
+            .client
+            .execute(&self.target, &follow_cmd)
+            .map_err(|e| ContainerLogError::SshError {
+                message: format!("Failed to execute bounded log follow: {}", e),
+            })?;
+
+        let mut emitted = 0usize;
+        for line in result.stdout.lines() {
+            if let Some(entry) = parse_docker_log_line(line, container_id) {
+                callback(entry);
+                emitted += 1;
+            }
+        }
+        if emitted == 0 && result.exit_code != 0 && result.exit_code != 124 {
+            // 124 = timeout 正常结束；其它非零视为失败
+            return Err(ContainerLogError::SshError {
+                message: format!(
+                    "bounded log follow failed (exit {}): {}",
+                    result.exit_code,
+                    result.stderr.chars().take(200).collect::<String>()
+                ),
+            });
         }
         Ok(())
     }

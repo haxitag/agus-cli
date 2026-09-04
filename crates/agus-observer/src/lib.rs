@@ -3,12 +3,14 @@ pub mod container_health;
 pub mod container_logs;
 pub mod junk_cleaner;
 pub mod nginx;
+pub mod ops_metrics;
+pub mod osv;
 pub mod performance_metrics;
 pub mod vulnerability;
 
 pub use alerting::{
-    Alert, AlertError, AlertManager, AlertMetrics, AlertRule, AlertSeverity, Comparison,
-    InMemoryAlertManager, MetricType,
+    Alert, AlertError, AlertManager, AlertMetrics, AlertRule, AlertSeverity, AlertStoreState,
+    Comparison, InMemoryAlertManager, MetricType,
 };
 pub use container_health::{ContainerHealth, ContainerHealthCheckResult, ContainerStatus};
 pub use container_logs::{
@@ -20,9 +22,11 @@ pub use junk_cleaner::{
     JunkFileItem,
 };
 pub use nginx::{scan_nginx_status, NginxServerBlock, NginxStatusReport};
+pub use ops_metrics::{collect_ops_custom_metrics, OpsCustomMetrics};
+pub use osv::{infer_osv_ecosystem, match_osv_vulnerabilities, OsvError, OsvMatch, OsvMatchReport};
 pub use performance_metrics::{
-    collect_system_metrics, CpuMetrics, DiskMetrics, LoadAverage, MemoryMetrics, NetworkInterface,
-    NetworkMetrics, SystemMetrics,
+    collect_system_metrics, compute_network_error_rate, CpuMetrics, DiskMetrics, LoadAverage,
+    MemoryMetrics, NetworkInterface, NetworkMetrics, SystemMetrics,
 };
 pub use vulnerability::{scan_vulnerability_context, SystemVulnerabilityContext};
 

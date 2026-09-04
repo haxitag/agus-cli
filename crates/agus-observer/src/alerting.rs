@@ -122,6 +122,13 @@ impl std::fmt::Display for AlertError {
 
 impl std::error::Error for AlertError {}
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlertStoreState {
+    pub rules: Vec<AlertRule>,
+    #[serde(default)]
+    pub active: Vec<Alert>,
+}
+
 pub struct InMemoryAlertManager {
     rules: HashMap<String, AlertRule>,
     active_alerts: HashMap<String, Alert>,
@@ -133,6 +140,26 @@ impl InMemoryAlertManager {
             rules: HashMap::new(),
             active_alerts: HashMap::new(),
         }
+    }
+
+    /// Snapshot compatible with CLI `alert_store.json` (`rules` + `active`).
+    pub fn to_store_state(&self) -> AlertStoreState {
+        AlertStoreState {
+            rules: self.rules.values().cloned().collect(),
+            active: self.active_alerts.values().cloned().collect(),
+        }
+    }
+
+    pub fn from_store_state(state: AlertStoreState) -> Self {
+        let mut manager = Self::new();
+        for rule in state.rules {
+            manager.rules.insert(rule.id.clone(), rule);
+        }
+        for alert in state.active {
+            let key = format!("{}_{:?}", alert.rule_id, alert.resource_id);
+            manager.active_alerts.insert(key, alert);
+        }
+        manager
     }
 
     fn evaluate_rule(&self, rule: &AlertRule, metrics: &AlertMetrics) -> Option<Alert> {

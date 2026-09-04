@@ -7,6 +7,27 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 
+/// 流式响应的 chunk 类型，区分普通内容、思考内容与用量
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// 普通回答内容
+    Content(String),
+    /// 思考过程内容（reasoning / thinking）
+    Reasoning(String),
+    /// API 返回的真实 token 用量（若 provider 支持）
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
+}
+
+/// 聊天消息（用于多轮对话上下文）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LlmProviderType {
     OpenAI,
@@ -295,12 +316,17 @@ pub trait LlmProvider: Send + Sync {
     }
 
     /// Stream a response from the LLM for a given prompt.
-    /// Returns a stream of text chunks. Default implementation returns an empty stream.
+    /// Returns a stream of chunks (content or reasoning). Default implementation returns an empty stream.
     /// Providers should implement this for streaming support.
+    /// When `messages` is provided, providers should use the messages array for multi-turn context.
+    /// When `max_tokens` is None, providers should use a sensible default (e.g. 4096).
     fn stream_response(
         &self,
         _prompt: &str,
-    ) -> Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send + '_>> {
+        _system_prompt: Option<&str>,
+        _messages: Option<&[ChatMessage]>,
+        _max_tokens: Option<u32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + '_>> {
         Box::pin(futures_util::stream::empty())
     }
 
@@ -379,7 +405,7 @@ impl OpenAILlmProvider {
                 }
             ],
             "temperature": 0.7,
-            "max_tokens": 1000
+            "max_tokens": 4096
         });
 
         let mut last_error = None;
@@ -466,11 +492,8 @@ impl LlmProvider for OpenAILlmProvider {
         graph: &ServiceDependencyGraph,
     ) -> Result<ServiceAnalysis, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(ServiceAnalysis {
-                performance_notes: vec!["LLM analysis requires API key configuration".to_string()],
-                security_concerns: vec![],
-                deployment_order_suggestions: vec![],
-                resource_requirements: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -531,10 +554,9 @@ impl LlmProvider for OpenAILlmProvider {
 
     fn generate_memo(&self, service_name: &str, action: &str) -> Result<String, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(format!(
-                "Deploy service {} with action {}",
-                service_name, action
-            ));
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
+            });
         }
 
         let prompt = format!(
@@ -547,10 +569,8 @@ impl LlmProvider for OpenAILlmProvider {
 
     fn assess_risk(&self, service_name: &str, action: &str) -> Result<RiskAssessment, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(RiskAssessment {
-                risk_level: "Medium".to_string(),
-                concerns: vec!["LLM risk assessment requires API key configuration".to_string()],
-                recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -599,16 +619,8 @@ impl LlmProvider for OpenAILlmProvider {
         context: Option<&str>,
     ) -> Result<ErrorDiagnosis, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(ErrorDiagnosis {
-                error_type: "Unknown".to_string(),
-                root_cause: "LLM API key not configured".to_string(),
-                severity: "Medium".to_string(),
-                possible_causes: vec![],
-                suggested_fixes: vec![],
-                prevention_tips: vec![],
-                fix_commands: vec![],
-                verification_steps: vec![],
-                rollback_steps: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -666,16 +678,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                         message: format!("Failed to parse error diagnosis: {}", e),
                     })
                 } else {
-                    Ok(ErrorDiagnosis {
-                        error_type: "Unknown".to_string(),
-                        root_cause: "Failed to parse LLM response".to_string(),
-                        severity: "Medium".to_string(),
-                        possible_causes: vec!["Unable to analyze error".to_string()],
-                        suggested_fixes: vec!["Check logs manually".to_string()],
-                        prevention_tips: vec![],
-                        fix_commands: vec![],
-                        verification_steps: vec![],
-                        rollback_steps: vec![],
+                    Err(LlmError::ParseError {
+                        message: "Failed to parse error diagnosis: no JSON object in LLM response".to_string(),
                     })
                 }
             }
@@ -688,16 +692,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         metrics: &PerformanceMetrics,
     ) -> Result<PerformanceEvaluation, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(PerformanceEvaluation {
-                service_name: service_name.to_string(),
-                overall_score: 50.0,
-                cpu_usage_analysis: "LLM API key not configured".to_string(),
-                memory_usage_analysis: String::new(),
-                network_analysis: String::new(),
-                bottlenecks: vec![],
-                optimization_suggestions: vec![],
-                scalability_assessment: String::new(),
-                resource_recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -736,16 +732,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                         message: format!("Failed to parse performance evaluation: {}", e),
                     })
                 } else {
-                    Ok(PerformanceEvaluation {
-                        service_name: service_name.to_string(),
-                        overall_score: 50.0,
-                        cpu_usage_analysis: "Failed to parse LLM response".to_string(),
-                        memory_usage_analysis: String::new(),
-                        network_analysis: String::new(),
-                        bottlenecks: vec![],
-                        optimization_suggestions: vec![],
-                        scalability_assessment: String::new(),
-                        resource_recommendations: vec![],
+                    Err(LlmError::ParseError {
+                        message: "Failed to parse performance evaluation: no JSON object in LLM response".to_string(),
                     })
                 }
             }
@@ -758,34 +746,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         graph: &ServiceDependencyGraph,
     ) -> Result<DependencyAnalysis, LlmError> {
         if self.config.api_key.is_empty() {
-            // Fallback: extract dependencies from graph
-            let dependencies: Vec<DependencyInfo> = graph
-                .edges
-                .iter()
-                .filter(|e| e.from == service_name)
-                .map(|e| DependencyInfo {
-                    service_name: e.to.clone(),
-                    dependency_type: "required".to_string(),
-                    impact_level: "medium".to_string(),
-                    description: String::new(),
-                })
-                .collect();
-
-            let dependents: Vec<String> = graph
-                .edges
-                .iter()
-                .filter(|e| e.to == service_name)
-                .map(|e| e.from.clone())
-                .collect();
-
-            return Ok(DependencyAnalysis {
-                service_name: service_name.to_string(),
-                dependencies,
-                dependents,
-                critical_path: vec![],
-                circular_risk: false,
-                deployment_order: vec![],
-                recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -868,46 +830,76 @@ Respond ONLY with valid JSON, no markdown formatting."#,
     fn stream_response(
         &self,
         prompt: &str,
-    ) -> Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send + '_>> {
-        if self.config.api_key.is_empty() {
-            return Box::pin(futures_util::stream::empty());
-        }
-
-        // Clone necessary data for the async task
+        system_prompt: Option<&str>,
+        messages: Option<&[ChatMessage]>,
+        max_tokens: Option<u32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + '_>> {
         let client = self.client.clone();
         let api_key = self.config.api_key.clone();
         let model = self.config.model.clone();
+        let base_url = self.config.base_url.clone();
         let prompt = prompt.to_string();
+        let system_prompt = system_prompt.unwrap_or("").to_string();
+        let messages = messages.map(|ms| ms.to_vec());
+        let max_tokens = max_tokens.unwrap_or(4096);
 
-        // Create a channel to bridge sync and async
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Spawn async task to handle streaming
         tokio::spawn(async move {
-            let url = "https://api.openai.com/v1/chat/completions";
+            if api_key.is_empty() {
+                let _ = tx.send(Err(LlmError::ConfigError {
+                    message: "OpenAI API key is not configured".to_string(),
+                }));
+                return;
+            }
+
+            let url = base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(|u| {
+                    let u = u.trim_end_matches('/');
+                    if u.ends_with("/chat/completions") {
+                        u.to_string()
+                    } else {
+                        format!("{u}/chat/completions")
+                    }
+                })
+                .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
+
+            let messages_arr = if let Some(ref msgs) = messages {
+                let mut arr: Vec<serde_json::Value> = Vec::new();
+                if !system_prompt.is_empty() {
+                    arr.push(serde_json::json!({"role": "system", "content": system_prompt}));
+                }
+                for m in msgs {
+                    arr.push(serde_json::json!({"role": m.role, "content": m.content}));
+                }
+                arr.push(serde_json::json!({"role": "user", "content": prompt}));
+                arr
+            } else {
+                let mut arr: Vec<serde_json::Value> = Vec::new();
+                if !system_prompt.is_empty() {
+                    arr.push(serde_json::json!({"role": "system", "content": system_prompt}));
+                }
+                arr.push(serde_json::json!({"role": "user", "content": prompt}));
+                arr
+            };
+
             let body = serde_json::json!({
                 "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an expert DevOps engineer helping with deployment planning."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
+                "messages": messages_arr,
                 "temperature": 0.7,
-                "max_tokens": 1000,
-                "stream": true
+                "max_tokens": max_tokens,
+                "stream": true,
+                "stream_options": { "include_usage": true }
             });
 
             let request = client
-                .post(url)
+                .post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(60));
+                .json(&body);
 
             match request.send().await {
                 Ok(response) => {
@@ -952,18 +944,49 @@ Respond ONLY with valid JSON, no markdown formatting."#,
 
                                         match serde_json::from_str::<serde_json::Value>(json_str) {
                                             Ok(json) => {
+                                                if let Some(usage) = json.get("usage") {
+                                                    let prompt_tokens = usage
+                                                        .get("prompt_tokens")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0) as u32;
+                                                    let completion_tokens = usage
+                                                        .get("completion_tokens")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0) as u32;
+                                                    if prompt_tokens > 0 || completion_tokens > 0 {
+                                                        let _ = tx.send(Ok(StreamChunk::Usage {
+                                                            prompt_tokens,
+                                                            completion_tokens,
+                                                        }));
+                                                    }
+                                                }
                                                 if let Some(choices) =
                                                     json.get("choices").and_then(|c| c.as_array())
                                                 {
                                                     if let Some(choice) = choices.first() {
                                                         if let Some(delta) = choice.get("delta") {
+                                                            // 处理 reasoning_content / thinking（思考模式）
+                                                            let reasoning_text = delta
+                                                                .get("reasoning_content")
+                                                                .and_then(|r| r.as_str())
+                                                                .or_else(|| {
+                                                                    delta.get("thinking").and_then(|t| t.as_str())
+                                                                });
+                                                            if let Some(reasoning) = reasoning_text {
+                                                                if !reasoning.is_empty() {
+                                                                    let _ = tx.send(Ok(
+                                                                        StreamChunk::Reasoning(reasoning.to_string())
+                                                                    ));
+                                                                }
+                                                            }
+                                                            // 处理普通 content
                                                             if let Some(content) = delta
                                                                 .get("content")
                                                                 .and_then(|c| c.as_str())
                                                             {
                                                                 if !content.is_empty() {
                                                                     let _ = tx.send(Ok(
-                                                                        content.to_string()
+                                                                        StreamChunk::Content(content.to_string())
                                                                     ));
                                                                 }
                                                             }
@@ -1231,16 +1254,8 @@ impl LlmProvider for OllamaLlmProvider {
         context: Option<&str>,
     ) -> Result<ErrorDiagnosis, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(ErrorDiagnosis {
-                error_type: "Unknown".to_string(),
-                root_cause: "LLM API key not configured".to_string(),
-                severity: "Medium".to_string(),
-                possible_causes: vec![],
-                suggested_fixes: vec![],
-                prevention_tips: vec![],
-                fix_commands: vec![],
-                verification_steps: vec![],
-                rollback_steps: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -1300,16 +1315,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                         message: format!("Failed to parse error diagnosis: {}", e),
                     })
                 } else {
-                    Ok(ErrorDiagnosis {
-                        error_type: "Unknown".to_string(),
-                        root_cause: "Failed to parse LLM response".to_string(),
-                        severity: "Medium".to_string(),
-                        possible_causes: vec!["Unable to analyze error".to_string()],
-                        suggested_fixes: vec!["Check logs manually".to_string()],
-                        prevention_tips: vec![],
-                        fix_commands: vec![],
-                        verification_steps: vec![],
-                        rollback_steps: vec![],
+                    Err(LlmError::ParseError {
+                        message: "Failed to parse error diagnosis: no JSON object in LLM response".to_string(),
                     })
                 }
             }
@@ -1322,16 +1329,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         metrics: &PerformanceMetrics,
     ) -> Result<PerformanceEvaluation, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(PerformanceEvaluation {
-                service_name: service_name.to_string(),
-                overall_score: 50.0,
-                cpu_usage_analysis: "LLM API key not configured".to_string(),
-                memory_usage_analysis: String::new(),
-                network_analysis: String::new(),
-                bottlenecks: vec![],
-                optimization_suggestions: vec![],
-                scalability_assessment: String::new(),
-                resource_recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -1370,16 +1369,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                         message: format!("Failed to parse performance evaluation: {}", e),
                     })
                 } else {
-                    Ok(PerformanceEvaluation {
-                        service_name: service_name.to_string(),
-                        overall_score: 50.0,
-                        cpu_usage_analysis: "Failed to parse LLM response".to_string(),
-                        memory_usage_analysis: String::new(),
-                        network_analysis: String::new(),
-                        bottlenecks: vec![],
-                        optimization_suggestions: vec![],
-                        scalability_assessment: String::new(),
-                        resource_recommendations: vec![],
+                    Err(LlmError::ParseError {
+                        message: "Failed to parse performance evaluation: no JSON object in LLM response".to_string(),
                     })
                 }
             }
@@ -1392,34 +1383,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         graph: &ServiceDependencyGraph,
     ) -> Result<DependencyAnalysis, LlmError> {
         if self.config.api_key.is_empty() {
-            // Fallback: extract dependencies from graph
-            let dependencies: Vec<DependencyInfo> = graph
-                .edges
-                .iter()
-                .filter(|e| e.from == service_name)
-                .map(|e| DependencyInfo {
-                    service_name: e.to.clone(),
-                    dependency_type: "required".to_string(),
-                    impact_level: "medium".to_string(),
-                    description: String::new(),
-                })
-                .collect();
-
-            let dependents: Vec<String> = graph
-                .edges
-                .iter()
-                .filter(|e| e.to == service_name)
-                .map(|e| e.from.clone())
-                .collect();
-
-            return Ok(DependencyAnalysis {
-                service_name: service_name.to_string(),
-                dependencies,
-                dependents,
-                critical_path: vec![],
-                circular_risk: false,
-                deployment_order: vec![],
-                recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -1497,8 +1462,10 @@ Respond ONLY with valid JSON, no markdown formatting."#,
     fn stream_response(
         &self,
         prompt: &str,
-    ) -> Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send + '_>> {
-        // Clone necessary data for the async task
+        system_prompt: Option<&str>,
+        messages: Option<&[ChatMessage]>,
+        max_tokens: Option<u32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + '_>> {
         let client = self.client.clone();
         let base_url = self
             .config
@@ -1507,24 +1474,44 @@ Respond ONLY with valid JSON, no markdown formatting."#,
             .unwrap_or_else(|| "http://localhost:11434".to_string());
         let model = self.config.model.clone();
         let prompt = prompt.to_string();
+        let system_prompt = system_prompt.unwrap_or("").to_string();
+        let messages = messages.map(|ms| ms.to_vec());
+        let num_predict = max_tokens.unwrap_or(4096);
 
-        // Create a channel to bridge sync and async
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Spawn async task to handle streaming
         tokio::spawn(async move {
-            let url = format!("{}/api/generate", base_url);
+            let url = format!("{}/api/chat", base_url);
+
+            let messages_arr = if let Some(ref msgs) = messages {
+                let mut arr: Vec<serde_json::Value> = Vec::new();
+                if !system_prompt.is_empty() {
+                    arr.push(serde_json::json!({"role": "system", "content": system_prompt}));
+                }
+                for m in msgs {
+                    arr.push(serde_json::json!({"role": m.role, "content": m.content}));
+                }
+                arr.push(serde_json::json!({"role": "user", "content": prompt}));
+                arr
+            } else {
+                let mut arr: Vec<serde_json::Value> = Vec::new();
+                if !system_prompt.is_empty() {
+                    arr.push(serde_json::json!({"role": "system", "content": system_prompt}));
+                }
+                arr.push(serde_json::json!({"role": "user", "content": prompt}));
+                arr
+            };
+
             let body = serde_json::json!({
                 "model": model,
-                "prompt": prompt,
+                "messages": messages_arr,
                 "stream": true
             });
 
             let request = client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(60));
+                .json(&body);
 
             match request.send().await {
                 Ok(response) => {
@@ -1554,7 +1541,6 @@ Respond ONLY with valid JSON, no markdown formatting."#,
 
                                 buffer.push_str(&text);
 
-                                // Process complete lines (Ollama sends JSON lines)
                                 while let Some(newline_pos) = buffer.find('\n') {
                                     let line = buffer[..newline_pos].trim().to_string();
                                     buffer = buffer[newline_pos + 1..].to_string();
@@ -1565,16 +1551,35 @@ Respond ONLY with valid JSON, no markdown formatting."#,
 
                                     match serde_json::from_str::<serde_json::Value>(&line) {
                                         Ok(json) => {
-                                            // Ollama streaming format: {"response": "chunk", "done": false}
+                                            // Ollama /api/chat format: {"message": {"role": "assistant", "content": "...", "thinking": "..."}, "done": false}
+                                            if let Some(message) = json.get("message") {
+                                                // 处理 thinking（推理模式）
+                                                if let Some(thinking) =
+                                                    message.get("thinking").and_then(|t| t.as_str())
+                                                {
+                                                    if !thinking.is_empty() {
+                                                        let _ = tx.send(Ok(StreamChunk::Reasoning(thinking.to_string())));
+                                                    }
+                                                }
+                                                // 处理 content
+                                                if let Some(content) =
+                                                    message.get("content").and_then(|c| c.as_str())
+                                                {
+                                                    if !content.is_empty() {
+                                                        let _ = tx.send(Ok(StreamChunk::Content(content.to_string())));
+                                                    }
+                                                }
+                                            }
+
+                                            // 兼容旧 /api/generate 格式（response 字段）
                                             if let Some(response) =
                                                 json.get("response").and_then(|r| r.as_str())
                                             {
                                                 if !response.is_empty() {
-                                                    let _ = tx.send(Ok(response.to_string()));
+                                                    let _ = tx.send(Ok(StreamChunk::Content(response.to_string())));
                                                 }
                                             }
 
-                                            // Check if done
                                             if json
                                                 .get("done")
                                                 .and_then(|d| d.as_bool())
@@ -1584,7 +1589,6 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                                             }
                                         }
                                         Err(_) => {
-                                            // Skip invalid JSON lines
                                             continue;
                                         }
                                     }
@@ -1607,7 +1611,6 @@ Respond ONLY with valid JSON, no markdown formatting."#,
             }
         });
 
-        // Convert receiver to stream
         Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
     }
 }
@@ -1638,7 +1641,7 @@ impl ClaudeLlmProvider {
         let url = "https://api.anthropic.com/v1/messages";
         let body = serde_json::json!({
             "model": self.config.model,
-            "max_tokens": 1000,
+            "max_tokens": 4096,
             "messages": [
                 {
                     "role": "user",
@@ -1731,11 +1734,8 @@ impl LlmProvider for ClaudeLlmProvider {
         graph: &ServiceDependencyGraph,
     ) -> Result<ServiceAnalysis, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(ServiceAnalysis {
-                performance_notes: vec!["LLM analysis requires API key configuration".to_string()],
-                security_concerns: vec![],
-                deployment_order_suggestions: vec![],
-                resource_requirements: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -1794,10 +1794,9 @@ impl LlmProvider for ClaudeLlmProvider {
 
     fn generate_memo(&self, service_name: &str, action: &str) -> Result<String, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(format!(
-                "Deploy service {} with action {}",
-                service_name, action
-            ));
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
+            });
         }
 
         let prompt = format!(
@@ -1810,10 +1809,8 @@ impl LlmProvider for ClaudeLlmProvider {
 
     fn assess_risk(&self, service_name: &str, action: &str) -> Result<RiskAssessment, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(RiskAssessment {
-                risk_level: "Medium".to_string(),
-                concerns: vec!["LLM risk assessment requires API key configuration".to_string()],
-                recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -1860,16 +1857,8 @@ impl LlmProvider for ClaudeLlmProvider {
         context: Option<&str>,
     ) -> Result<ErrorDiagnosis, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(ErrorDiagnosis {
-                error_type: "Unknown".to_string(),
-                root_cause: "LLM API key not configured".to_string(),
-                severity: "Medium".to_string(),
-                possible_causes: vec![],
-                suggested_fixes: vec![],
-                prevention_tips: vec![],
-                fix_commands: vec![],
-                verification_steps: vec![],
-                rollback_steps: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -1927,16 +1916,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                         message: format!("Failed to parse error diagnosis: {}", e),
                     })
                 } else {
-                    Ok(ErrorDiagnosis {
-                        error_type: "Unknown".to_string(),
-                        root_cause: "Failed to parse LLM response".to_string(),
-                        severity: "Medium".to_string(),
-                        possible_causes: vec!["Unable to analyze error".to_string()],
-                        suggested_fixes: vec!["Check logs manually".to_string()],
-                        prevention_tips: vec![],
-                        fix_commands: vec![],
-                        verification_steps: vec![],
-                        rollback_steps: vec![],
+                    Err(LlmError::ParseError {
+                        message: "Failed to parse error diagnosis: no JSON object in LLM response".to_string(),
                     })
                 }
             }
@@ -1949,16 +1930,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         metrics: &PerformanceMetrics,
     ) -> Result<PerformanceEvaluation, LlmError> {
         if self.config.api_key.is_empty() {
-            return Ok(PerformanceEvaluation {
-                service_name: service_name.to_string(),
-                overall_score: 50.0,
-                cpu_usage_analysis: "LLM API key not configured".to_string(),
-                memory_usage_analysis: String::new(),
-                network_analysis: String::new(),
-                bottlenecks: vec![],
-                optimization_suggestions: vec![],
-                scalability_assessment: String::new(),
-                resource_recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -1997,16 +1970,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                         message: format!("Failed to parse performance evaluation: {}", e),
                     })
                 } else {
-                    Ok(PerformanceEvaluation {
-                        service_name: service_name.to_string(),
-                        overall_score: 50.0,
-                        cpu_usage_analysis: "Failed to parse LLM response".to_string(),
-                        memory_usage_analysis: String::new(),
-                        network_analysis: String::new(),
-                        bottlenecks: vec![],
-                        optimization_suggestions: vec![],
-                        scalability_assessment: String::new(),
-                        resource_recommendations: vec![],
+                    Err(LlmError::ParseError {
+                        message: "Failed to parse performance evaluation: no JSON object in LLM response".to_string(),
                     })
                 }
             }
@@ -2019,33 +1984,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         graph: &ServiceDependencyGraph,
     ) -> Result<DependencyAnalysis, LlmError> {
         if self.config.api_key.is_empty() {
-            let dependencies: Vec<DependencyInfo> = graph
-                .edges
-                .iter()
-                .filter(|e| e.from == service_name)
-                .map(|e| DependencyInfo {
-                    service_name: e.to.clone(),
-                    dependency_type: "required".to_string(),
-                    impact_level: "medium".to_string(),
-                    description: String::new(),
-                })
-                .collect();
-
-            let dependents: Vec<String> = graph
-                .edges
-                .iter()
-                .filter(|e| e.to == service_name)
-                .map(|e| e.from.clone())
-                .collect();
-
-            return Ok(DependencyAnalysis {
-                service_name: service_name.to_string(),
-                dependencies,
-                dependents,
-                critical_path: vec![],
-                circular_risk: false,
-                deployment_order: vec![],
-                recommendations: vec![],
+            return Err(LlmError::ConfigError {
+                message: "LLM API key not configured".to_string(),
             });
         }
 
@@ -2123,6 +2063,196 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         }
         run_async(self.call_api_with_retry(prompt, 3))
     }
+
+    fn stream_response(
+        &self,
+        prompt: &str,
+        system_prompt: Option<&str>,
+        messages: Option<&[ChatMessage]>,
+        max_tokens: Option<u32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + '_>> {
+        let client = self.client.clone();
+        let api_key = self.config.api_key.clone();
+        let model = self.config.model.clone();
+        let base_url = self.config.base_url.clone();
+        let prompt = prompt.to_string();
+        let system_prompt = system_prompt.unwrap_or("").to_string();
+        let messages = messages.map(|ms| ms.to_vec());
+        let max_tokens = max_tokens.unwrap_or(4096);
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            if api_key.is_empty() {
+                let _ = tx.send(Err(LlmError::ConfigError {
+                    message: "Claude API key is not configured".to_string(),
+                }));
+                return;
+            }
+
+            let url = base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .unwrap_or("https://api.anthropic.com/v1/messages");
+
+            let messages_arr = if let Some(ref msgs) = messages {
+                let mut arr: Vec<serde_json::Value> = msgs
+                    .iter()
+                    .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                    .collect();
+                // 追加当前用户消息
+                arr.push(serde_json::json!({"role": "user", "content": prompt}));
+                arr
+            } else {
+                vec![serde_json::json!({"role": "user", "content": prompt})]
+            };
+
+            let mut body = serde_json::json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": messages_arr,
+                "stream": true
+            });
+            if !system_prompt.is_empty() {
+                body["system"] = serde_json::Value::String(system_prompt.clone());
+            }
+
+            let request = client
+                .post(url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&body);
+
+            match request.send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        let _ = tx.send(Err(LlmError::ApiError {
+                            message: format!("Claude API error: {} - {}", status, body),
+                        }));
+                        return;
+                    }
+
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+
+                    use futures_util::StreamExt as _;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(bytes) => {
+                                let text = match String::from_utf8(bytes.to_vec()) {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(LlmError::ParseError {
+                                            message: format!("Invalid UTF-8: {}", e),
+                                        }));
+                                        continue;
+                                    }
+                                };
+
+                                buffer.push_str(&text);
+
+                                while let Some(newline_pos) = buffer.find('\n') {
+                                    let line = buffer[..newline_pos].trim().to_string();
+                                    buffer = buffer[newline_pos + 1..].to_string();
+
+                                    if line.is_empty() {
+                                        continue;
+                                    }
+
+                                    if line.starts_with("data: ") {
+                                        let data = &line[6..];
+                                        if let Ok(json) =
+                                            serde_json::from_str::<serde_json::Value>(data)
+                                        {
+                                            let event_type = json
+                                                .get("type")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("");
+
+                                            match event_type {
+                                                "content_block_delta" => {
+                                                    if let Some(delta) =
+                                                        json.get("delta")
+                                                    {
+                                                        let delta_type = delta
+                                                            .get("type")
+                                                            .and_then(|t| t.as_str())
+                                                            .unwrap_or("");
+
+                                                        match delta_type {
+                                                            "thinking_delta" => {
+                                                                if let Some(thinking) =
+                                                                    delta.get("thinking").and_then(|t| t.as_str())
+                                                                {
+                                                                    if !thinking.is_empty() {
+                                                                        let _ = tx.send(Ok(
+                                                                            StreamChunk::Reasoning(
+                                                                                thinking.to_string(),
+                                                                            ),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            "text_delta" => {
+                                                                if let Some(text) =
+                                                                    delta.get("text").and_then(|t| t.as_str())
+                                                                {
+                                                                    if !text.is_empty() {
+                                                                        let _ = tx.send(Ok(
+                                                                            StreamChunk::Content(
+                                                                                text.to_string(),
+                                                                            ),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                }
+                                                "message_stop" => {
+                                                    return;
+                                                }
+                                                "error" => {
+                                                    let err_msg = json
+                                                        .get("error")
+                                                        .and_then(|e| e.get("message"))
+                                                        .and_then(|m| m.as_str())
+                                                        .unwrap_or("Unknown error");
+                                                    let _ = tx.send(Err(LlmError::ApiError {
+                                                        message: err_msg.to_string(),
+                                                    }));
+                                                    return;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(LlmError::NetworkError {
+                                    message: format!("Stream error: {}", e),
+                                }));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(LlmError::NetworkError {
+                        message: format!("Network error: {}", e),
+                    }));
+                }
+            }
+        });
+
+        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+    }
 }
 
 // Generic OpenAI-compatible provider for OpenRouter, DeepSeek, etc.
@@ -2163,7 +2293,7 @@ impl OpenAICompatibleProvider {
                 }
             ],
             "temperature": 0.7,
-            "max_tokens": 1000
+            "max_tokens": 4096
         });
 
         let mut last_error = None;
@@ -2253,11 +2383,8 @@ macro_rules! impl_llm_provider_for_openai_compatible {
             graph: &ServiceDependencyGraph,
         ) -> Result<ServiceAnalysis, LlmError> {
             if self.config.api_key.is_empty() {
-                return Ok(ServiceAnalysis {
-                    performance_notes: vec!["LLM analysis requires API key configuration".to_string()],
-                    security_concerns: vec![],
-                    deployment_order_suggestions: vec![],
-                    resource_requirements: vec![],
+                return Err(LlmError::ConfigError {
+                    message: "LLM API key not configured".to_string(),
                 });
             }
 
@@ -2300,7 +2427,9 @@ macro_rules! impl_llm_provider_for_openai_compatible {
 
         fn generate_memo(&self, service_name: &str, action: &str) -> Result<String, LlmError> {
             if self.config.api_key.is_empty() {
-                return Ok(format!("Deploy service {} with action {}", service_name, action));
+                return Err(LlmError::ConfigError {
+                    message: "LLM API key not configured".to_string(),
+                });
             }
 
             let prompt = format!(
@@ -2313,10 +2442,8 @@ macro_rules! impl_llm_provider_for_openai_compatible {
 
         fn assess_risk(&self, service_name: &str, action: &str) -> Result<RiskAssessment, LlmError> {
             if self.config.api_key.is_empty() {
-                return Ok(RiskAssessment {
-                    risk_level: "Medium".to_string(),
-                    concerns: vec!["LLM risk assessment requires API key configuration".to_string()],
-                    recommendations: vec![],
+                return Err(LlmError::ConfigError {
+                    message: "LLM API key not configured".to_string(),
                 });
             }
 
@@ -2358,16 +2485,8 @@ macro_rules! impl_llm_provider_for_openai_compatible {
             context: Option<&str>,
         ) -> Result<ErrorDiagnosis, LlmError> {
             if self.config.api_key.is_empty() {
-                return Ok(ErrorDiagnosis {
-                    error_type: "Unknown".to_string(),
-                    root_cause: "LLM API key not configured".to_string(),
-                    severity: "Medium".to_string(),
-                    possible_causes: vec![],
-                    suggested_fixes: vec![],
-                    prevention_tips: vec![],
-                    fix_commands: vec![],
-                    verification_steps: vec![],
-                    rollback_steps: vec![],
+                return Err(LlmError::ConfigError {
+                    message: "LLM API key not configured".to_string(),
                 });
             }
 
@@ -2415,16 +2534,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                             message: format!("Failed to parse error diagnosis: {}", e),
                         })
                     } else {
-                        Ok(ErrorDiagnosis {
-                            error_type: "Unknown".to_string(),
-                            root_cause: "Failed to parse LLM response".to_string(),
-                            severity: "Medium".to_string(),
-                            possible_causes: vec!["Unable to analyze error".to_string()],
-                            suggested_fixes: vec!["Check logs manually".to_string()],
-                            prevention_tips: vec![],
-                            fix_commands: vec![],
-                            verification_steps: vec![],
-                            rollback_steps: vec![],
+                        Err(LlmError::ParseError {
+                            message: "Failed to parse error diagnosis: no JSON object in LLM response".to_string(),
                         })
                     }
                 }
@@ -2437,16 +2548,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
             metrics: &PerformanceMetrics,
         ) -> Result<PerformanceEvaluation, LlmError> {
             if self.config.api_key.is_empty() {
-                return Ok(PerformanceEvaluation {
-                    service_name: service_name.to_string(),
-                    overall_score: 50.0,
-                    cpu_usage_analysis: "LLM API key not configured".to_string(),
-                    memory_usage_analysis: String::new(),
-                    network_analysis: String::new(),
-                    bottlenecks: vec![],
-                    optimization_suggestions: vec![],
-                    scalability_assessment: String::new(),
-                    resource_recommendations: vec![],
+                return Err(LlmError::ConfigError {
+                    message: "LLM API key not configured".to_string(),
                 });
             }
 
@@ -2485,16 +2588,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                             message: format!("Failed to parse performance evaluation: {}", e),
                         })
                     } else {
-                        Ok(PerformanceEvaluation {
-                            service_name: service_name.to_string(),
-                            overall_score: 50.0,
-                            cpu_usage_analysis: "Failed to parse LLM response".to_string(),
-                            memory_usage_analysis: String::new(),
-                            network_analysis: String::new(),
-                            bottlenecks: vec![],
-                            optimization_suggestions: vec![],
-                            scalability_assessment: String::new(),
-                            resource_recommendations: vec![],
+                        Err(LlmError::ParseError {
+                            message: "Failed to parse performance evaluation: no JSON object in LLM response".to_string(),
                         })
                     }
                 }
@@ -2507,33 +2602,8 @@ Respond ONLY with valid JSON, no markdown formatting."#,
             graph: &ServiceDependencyGraph,
         ) -> Result<DependencyAnalysis, LlmError> {
             if self.config.api_key.is_empty() {
-                let dependencies: Vec<DependencyInfo> = graph
-                    .edges
-                    .iter()
-                    .filter(|e| e.from == service_name)
-                    .map(|e| DependencyInfo {
-                        service_name: e.to.clone(),
-                        dependency_type: "required".to_string(),
-                        impact_level: "medium".to_string(),
-                        description: String::new(),
-                    })
-                    .collect();
-
-                let dependents: Vec<String> = graph
-                    .edges
-                    .iter()
-                    .filter(|e| e.to == service_name)
-                    .map(|e| e.from.clone())
-                    .collect();
-
-                return Ok(DependencyAnalysis {
-                    service_name: service_name.to_string(),
-                    dependencies,
-                    dependents,
-                    critical_path: vec![],
-                    circular_risk: false,
-                    deployment_order: vec![],
-                    recommendations: vec![],
+                return Err(LlmError::ConfigError {
+                    message: "LLM API key not configured".to_string(),
                 });
             }
 
@@ -2620,45 +2690,54 @@ impl LlmProvider for OpenAICompatibleProvider {
     fn stream_response(
         &self,
         prompt: &str,
-    ) -> Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send + '_>> {
-        if self.config.api_key.is_empty() {
-            return Box::pin(futures_util::stream::empty());
-        }
-
-        // Clone necessary data for the async task
+        system_prompt: Option<&str>,
+        messages: Option<&[ChatMessage]>,
+        max_tokens: Option<u32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + '_>> {
         let client = self.client.clone();
         let api_url = self.api_url.clone();
         let api_key = self.config.api_key.clone();
         let model = self.config.model.clone();
         let prompt = prompt.to_string();
+        let system_prompt = system_prompt.unwrap_or("").to_string();
+        let messages = messages.map(|ms| ms.to_vec());
+        let max_tokens = max_tokens.unwrap_or(4096);
 
-        // Create a channel to bridge sync and async
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Spawn async task to handle streaming
         tokio::spawn(async move {
+            let messages_arr = if let Some(ref msgs) = messages {
+                let mut arr: Vec<serde_json::Value> = Vec::new();
+                if !system_prompt.is_empty() {
+                    arr.push(serde_json::json!({"role": "system", "content": system_prompt}));
+                }
+                for m in msgs {
+                    arr.push(serde_json::json!({"role": m.role, "content": m.content}));
+                }
+                arr.push(serde_json::json!({"role": "user", "content": prompt}));
+                arr
+            } else {
+                let mut arr: Vec<serde_json::Value> = Vec::new();
+                if !system_prompt.is_empty() {
+                    arr.push(serde_json::json!({"role": "system", "content": system_prompt}));
+                }
+                arr.push(serde_json::json!({"role": "user", "content": prompt}));
+                arr
+            };
+
             let body = serde_json::json!({
                 "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an expert DevOps engineer helping with deployment planning."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
+                "messages": messages_arr,
                 "temperature": 0.7,
-                "max_tokens": 1000,
-                "stream": true
+                "max_tokens": max_tokens,
+                "stream": true,
+                "stream_options": { "include_usage": true }
             });
 
             let mut request = client
                 .post(&api_url)
                 .header("Content-Type", "application/json")
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(60));
+                .json(&body);
 
             if !api_key.is_empty() {
                 request = request.header("Authorization", format!("Bearer {}", api_key));
@@ -2707,18 +2786,49 @@ impl LlmProvider for OpenAICompatibleProvider {
 
                                         match serde_json::from_str::<serde_json::Value>(json_str) {
                                             Ok(json) => {
+                                                if let Some(usage) = json.get("usage") {
+                                                    let prompt_tokens = usage
+                                                        .get("prompt_tokens")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0) as u32;
+                                                    let completion_tokens = usage
+                                                        .get("completion_tokens")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0) as u32;
+                                                    if prompt_tokens > 0 || completion_tokens > 0 {
+                                                        let _ = tx.send(Ok(StreamChunk::Usage {
+                                                            prompt_tokens,
+                                                            completion_tokens,
+                                                        }));
+                                                    }
+                                                }
                                                 if let Some(choices) =
                                                     json.get("choices").and_then(|c| c.as_array())
                                                 {
                                                     if let Some(choice) = choices.first() {
                                                         if let Some(delta) = choice.get("delta") {
+                                                            // 处理 reasoning_content / thinking（思考模式）
+                                                            let reasoning_text = delta
+                                                                .get("reasoning_content")
+                                                                .and_then(|r| r.as_str())
+                                                                .or_else(|| {
+                                                                    delta.get("thinking").and_then(|t| t.as_str())
+                                                                });
+                                                            if let Some(reasoning) = reasoning_text {
+                                                                if !reasoning.is_empty() {
+                                                                    let _ = tx.send(Ok(
+                                                                        StreamChunk::Reasoning(reasoning.to_string())
+                                                                    ));
+                                                                }
+                                                            }
+                                                            // 处理普通 content
                                                             if let Some(content) = delta
                                                                 .get("content")
                                                                 .and_then(|c| c.as_str())
                                                             {
                                                                 if !content.is_empty() {
                                                                     let _ = tx.send(Ok(
-                                                                        content.to_string()
+                                                                        StreamChunk::Content(content.to_string())
                                                                     ));
                                                                 }
                                                             }
@@ -2913,7 +3023,7 @@ impl AlibabaQwenLlmProvider {
             },
             "parameters": {
                 "temperature": 0.7,
-                "max_tokens": 1000
+                "max_tokens": 4096
             }
         });
 
@@ -3035,7 +3145,7 @@ impl ZhipuLlmProvider {
                 }
             ],
             "temperature": 0.7,
-            "max_tokens": 1000
+            "max_tokens": 4096
         });
 
         let mut last_error = None;
@@ -3121,7 +3231,17 @@ pub fn create_llm_provider(config: LlmConfig) -> Result<Box<dyn LlmProvider>, Ll
         LlmProviderType::OpenAI => Ok(Box::new(OpenAILlmProvider::new(config))),
         LlmProviderType::Ollama => Ok(Box::new(OllamaLlmProvider::new(config))),
         LlmProviderType::Claude => Ok(Box::new(ClaudeLlmProvider::new(config))),
-        LlmProviderType::Gemini => Ok(Box::new(GeminiLlmProvider::new(config))),
+        LlmProviderType::Gemini => {
+            let api_url = config
+                .base_url
+                .clone()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| {
+                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string()
+                });
+            Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
+        }
         LlmProviderType::OpenRouter => {
             let api_url = config
                 .base_url
@@ -3129,7 +3249,17 @@ pub fn create_llm_provider(config: LlmConfig) -> Result<Box<dyn LlmProvider>, Ll
                 .unwrap_or_else(|| "https://openrouter.ai/api/v1/chat/completions".to_string());
             Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
         }
-        LlmProviderType::AlibabaQwen => Ok(Box::new(AlibabaQwenLlmProvider::new(config))),
+        LlmProviderType::AlibabaQwen => {
+            let api_url = config
+                .base_url
+                .clone()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| {
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string()
+                });
+            Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
+        }
         LlmProviderType::DeepSeek => {
             let api_url = config
                 .base_url
@@ -3138,13 +3268,22 @@ pub fn create_llm_provider(config: LlmConfig) -> Result<Box<dyn LlmProvider>, Ll
             Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
         }
         LlmProviderType::MinMAX => {
-            // MinMAX is OpenAI compatible
             let api_url = config.base_url.clone().unwrap_or_else(|| {
                 "https://api.minimax.chat/v1/text/chatcompletion_v2".to_string()
             });
             Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
         }
-        LlmProviderType::Zhipu => Ok(Box::new(ZhipuLlmProvider::new(config))),
+        LlmProviderType::Zhipu => {
+            let api_url = config
+                .base_url
+                .clone()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| {
+                    "https://open.bigmodel.cn/api/paas/v4/chat/completions".to_string()
+                });
+            Ok(Box::new(OpenAICompatibleProvider::new(config, api_url)))
+        }
         LlmProviderType::DashScope => {
             let api_url = config
                 .base_url

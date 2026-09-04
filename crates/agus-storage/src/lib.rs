@@ -644,6 +644,7 @@ mod tests {
             identity_file: None,
             password: None,
             group_id: None,
+            health_check_url: None,
         }];
 
         storage.save_hosts(&hosts).unwrap();
@@ -668,6 +669,7 @@ mod tests {
             identity_file: None,
             password: None,
             group_id: None,
+            health_check_url: None,
         }];
 
         storage.save_hosts(&hosts).unwrap();

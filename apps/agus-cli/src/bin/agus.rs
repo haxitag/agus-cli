@@ -7,7 +7,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agus_cli_core::{
-    admin, audit, context, exec, executions, hosts, plan, projects, risk, CliError,
+    admin, audit, config, context, exec, executions, hosts, plan, projects, risk,
+    terminal_history, CliError,
 };
 use agus_core_domain::{
     DeploymentAction, DeploymentPlan, DeploymentStep, Environment, ExecutionRecord, ExecutionStatus,
@@ -30,14 +31,26 @@ use agus_storage::create_storage_backend;
 use chrono::{
     DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc,
 };
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
+use rustyline::error::ReadlineError;
+use rustyline::completion::{Completer, Pair};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::history::DefaultHistory;
+use rustyline::{Context, Editor, Helper};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    Table,
-    Json,
-}
+#[path = "../cli_style.rs"]
+mod cli_style;
+#[path = "../cli_format.rs"]
+mod cli_format;
+#[path = "../cli_progress.rs"]
+mod cli_progress;
+use cli_format::OutputFormat;
+use cli_format::print_value;
+use cli_progress::{CliSpinner, use_progress, use_progress_unconditional};
+use cli_style::ColorMode;
 
 #[derive(Parser)]
 #[command(name = "agus")]
@@ -45,6 +58,8 @@ enum OutputFormat {
 struct AgusCli {
     #[arg(long, default_value = "table", value_enum)]
     format: OutputFormat,
+    #[arg(long, default_value = "auto", value_enum, global = true)]
+    color: ColorMode,
     #[command(subcommand)]
     command: Option<AgusCommand>,
 }
@@ -107,6 +122,7 @@ enum HostCommand {
     Remove(HostRemoveCommand),
     Show(HostShowCommand),
     Check(HostCheckCommand),
+    MigratePasswords,
 }
 
 #[derive(Args)]
@@ -502,6 +518,7 @@ fn main() {
 
 fn run() -> Result<i32, CliError> {
     let cli = AgusCli::parse();
+    cli.color.init();
     match cli.command {
         Some(command) => handle_command(command, cli.format),
         None => {
@@ -635,21 +652,11 @@ fn handle_host(cmd: HostCommand, format: OutputFormat) -> Result<(), CliError> {
             }
             log_cli_event("cli host list");
             match format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&hosts)?);
+                OutputFormat::Json | OutputFormat::Yaml => {
+                    print_value(format, &hosts)?;
                 }
                 OutputFormat::Table => {
-                    for host in hosts {
-                        println!(
-                            "{}\t{}\t{}:{}\t{:?}\t{}",
-                            host.id,
-                            host.address,
-                            host.user,
-                            host.port,
-                            host.environment,
-                            host.labels.join(",")
-                        );
-                    }
+                    cli_style::print_host_table(&hosts);
                 }
             }
         }
@@ -673,42 +680,32 @@ fn handle_host(cmd: HostCommand, format: OutputFormat) -> Result<(), CliError> {
                 identity_file: cmd.identity_file,
                 password: cmd.password,
                 group_id: cmd.group_id,
+                health_check_url: None,
             };
             existing.retain(|item| item.id != host.id);
             existing.push(host);
             hosts::save_hosts(&existing)?;
             log_cli_event(&format!("cli host add id={} addr={}", host_id, host_addr));
-            println!("Host saved.");
+            cli_style::print_ok("Host saved.");
         }
         HostCommand::Remove(cmd) => {
             let removed = hosts::remove_host(&cmd.id)?;
             if removed {
                 log_cli_event(&format!("cli host remove id={}", cmd.id));
-                println!("Host removed.");
+                cli_style::print_ok("Host removed.");
             } else {
-                println!("Host not found.");
+                cli_style::print_warn("Host not found.");
             }
         }
         HostCommand::Show(cmd) => {
             let host = hosts::find_host(&cmd.id)?;
             log_cli_event(&format!("cli host show id={}", cmd.id));
             match format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&host)?);
+                OutputFormat::Json | OutputFormat::Yaml => {
+                    print_value(format, &host)?;
                 }
                 OutputFormat::Table => {
-                    println!("id: {}", host.id);
-                    println!("address: {}", host.address);
-                    println!("user: {}", host.user);
-                    println!("port: {}", host.port);
-                    println!("environment: {:?}", host.environment);
-                    println!("labels: {}", host.labels.join(","));
-                    if let Some(group) = host.group_id {
-                        println!("group: {group}");
-                    }
-                    if let Some(identity) = host.identity_file {
-                        println!("identity_file: {identity}");
-                    }
+                    cli_style::print_host_show(&host);
                 }
             }
         }
@@ -717,9 +714,11 @@ fn handle_host(cmd: HostCommand, format: OutputFormat) -> Result<(), CliError> {
             log_cli_event(&format!("cli host check id={}", cmd.id));
             let target = exec::ssh_target_from_host(&host);
             let client = ProcessSshClient::new();
+            let spinner = CliSpinner::new(use_progress(format), &format!("检查主机 {}", host.id));
             let result = client.execute(&target, &cmd.cmd);
+            spinner.finish_and_clear();
             match (format, result) {
-                (OutputFormat::Json, Ok(output)) => {
+                (OutputFormat::Json | OutputFormat::Yaml, Ok(output)) => {
                     let value = serde_json::json!({
                         "host_id": host.id,
                         "address": host.address,
@@ -728,25 +727,29 @@ fn handle_host(cmd: HostCommand, format: OutputFormat) -> Result<(), CliError> {
                         "stdout": output.stdout,
                         "stderr": output.stderr,
                     });
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    print_value(format, &value)?;
                 }
-                (OutputFormat::Json, Err(err)) => {
+                (OutputFormat::Json | OutputFormat::Yaml, Err(err)) => {
                     let value = serde_json::json!({
                         "host_id": host.id,
                         "address": host.address,
                         "ok": false,
                         "error": err.to_string(),
                     });
-                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    print_value(format, &value)?;
                     return Err(CliError::Ssh(err));
                 }
                 (OutputFormat::Table, Ok(output)) => {
                     if output.exit_code == 0 {
-                        println!("OK\t{}\t{}", host.id, host.address);
+                        cli_style::print_host_check_ok(&host.id, &host.address);
                     } else {
-                        println!("FAIL\t{}\t{}\texit={}", host.id, host.address, output.exit_code);
+                        cli_style::print_host_check_fail(
+                            &host.id,
+                            &host.address,
+                            &format!("exit={}", output.exit_code),
+                        );
                         if !output.stderr.trim().is_empty() {
-                            println!("{}", output.stderr.trim());
+                            eprintln!("{}", output.stderr.trim());
                         }
                         return Err(CliError::Ssh(agus_ssh::SshError::Command {
                             exit_code: output.exit_code,
@@ -755,9 +758,47 @@ fn handle_host(cmd: HostCommand, format: OutputFormat) -> Result<(), CliError> {
                     }
                 }
                 (OutputFormat::Table, Err(err)) => {
-                    println!("FAIL\t{}\t{}\t{}", host.id, host.address, err);
+                    cli_style::print_host_check_fail(&host.id, &host.address, &err.to_string());
                     return Err(CliError::Ssh(err));
                 }
+            }
+        }
+        HostCommand::MigratePasswords => {
+            let storage = hosts::load_hosts_raw()?;
+            let pending = storage
+                .iter()
+                .filter(|host| {
+                    host.password
+                        .as_deref()
+                        .map(|value| {
+                            !value.trim().is_empty()
+                                && !value.trim().starts_with(agus_cli_core::host_password::SECRET_REF_PREFIX)
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            let already = storage
+                .iter()
+                .filter(|host| {
+                    host.password
+                        .as_deref()
+                        .map(|value| value.trim().starts_with(agus_cli_core::host_password::SECRET_REF_PREFIX))
+                        .unwrap_or(false)
+                })
+                .count();
+            let spinner = CliSpinner::new(
+                use_progress_unconditional(),
+                "迁移主机密码到 secret store",
+            );
+            let migrated = hosts::migrate_all_host_passwords()?;
+            spinner.finish_and_clear();
+            log_cli_event(&format!("cli host migrate-passwords migrated={migrated}"));
+            if migrated > 0 {
+                println!("已迁移 {migrated} 台主机密码（FinalShell 密文解密 + 写入 secret store）");
+            } else if pending == 0 && already > 0 {
+                println!("无需迁移：{already} 台主机密码已在 secret store 中（__secret__ 引用）");
+            } else {
+                println!("未发现需要迁移的主机密码（共 {} 台主机）", storage.len());
             }
         }
     }
@@ -962,7 +1003,7 @@ fn handle_plan(cmd: PlanCommand) -> Result<(), CliError> {
 
 fn handle_deploy(cmd: DeployCommand, format: OutputFormat) -> Result<(), CliError> {
     match cmd {
-        DeployCommand::Run(cmd) => handle_deploy_run(cmd),
+        DeployCommand::Run(cmd) => handle_deploy_run(cmd, format),
         DeployCommand::Status(cmd) => handle_deploy_status(cmd, format),
         DeployCommand::Logs(cmd) => handle_deploy_logs(cmd),
         DeployCommand::Resume(cmd) => handle_deploy_resume(cmd),
@@ -1033,7 +1074,7 @@ struct ExecutionCheckpointInfo {
     mode_type: String,
 }
 
-fn handle_deploy_run(cmd: DeployRunCommand) -> Result<(), CliError> {
+fn handle_deploy_run(cmd: DeployRunCommand, format: OutputFormat) -> Result<(), CliError> {
     let plan_path = PathBuf::from(&cmd.plan);
     let plan = plan::load_plan(&plan_path)?;
     let mode = DeployMode::parse(&cmd.mode)?;
@@ -1052,6 +1093,11 @@ fn handle_deploy_run(cmd: DeployRunCommand) -> Result<(), CliError> {
     };
     executions::write_session_info(&session_info)?;
 
+    let spinner = CliSpinner::new(
+        use_progress(format),
+        &format!("执行部署计划 ({})", mode.label()),
+    );
+
     let (session, stream_handle) =
         create_execution_session(mode, plan.clone(), host_ctx.clone(), cmd.stream)?;
 
@@ -1066,7 +1112,7 @@ fn handle_deploy_run(cmd: DeployRunCommand) -> Result<(), CliError> {
     }
 
     executions::update_finished_at(&execution_id, current_timestamp_ms())?;
-    println!("Execution completed: {}", execution_id);
+    spinner.finish_success(&format!("Execution completed: {execution_id}"));
     Ok(())
 }
 
@@ -1077,8 +1123,8 @@ fn handle_deploy_status(cmd: DeployStatusCommand, format: OutputFormat) -> Resul
         return Ok(());
     }
     match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&records)?);
+        OutputFormat::Json | OutputFormat::Yaml => {
+            print_value(format, &records)?;
         }
         OutputFormat::Table => {
             for record in records {
@@ -1163,8 +1209,8 @@ fn handle_deploy_list(format: OutputFormat) -> Result<(), CliError> {
         return Ok(());
     }
     match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&sessions)?);
+        OutputFormat::Json | OutputFormat::Yaml => {
+            print_value(format, &sessions)?;
         }
         OutputFormat::Table => {
             for session in sessions {
@@ -1363,8 +1409,10 @@ fn handle_security(cmd: SecurityCommand) -> Result<(), CliError> {
             let host = hosts::find_host(&cmd.host)?;
             let target = exec::ssh_target_from_host(&host);
             let client = ProcessSshClient::new();
+            let spinner = CliSpinner::new(use_progress_unconditional(), &format!("扫描垃圾文件 ({})", host.id));
             let items = scan_junk_files(&client, &target)
                 .map_err(|e| CliError::InvalidInput(format!("junk scan failed: {e}")))?;
+            spinner.finish_and_clear();
             println!("{}", serde_json::to_string_pretty(&items)?);
         }
         SecurityCommand::CleanJunk(cmd) => {
@@ -1379,16 +1427,20 @@ fn handle_security(cmd: SecurityCommand) -> Result<(), CliError> {
             let host = hosts::find_host(&cmd.host)?;
             let target = exec::ssh_target_from_host(&host);
             let client = ProcessSshClient::new();
+            let spinner = CliSpinner::new(use_progress_unconditional(), &format!("漏洞上下文扫描 ({})", host.id));
             let report = scan_vulnerability_context(&client, &target)
                 .map_err(|e| CliError::InvalidInput(format!("vulnerability scan failed: {e}")))?;
+            spinner.finish_and_clear();
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         SecurityCommand::Nginx(cmd) => {
             let host = hosts::find_host(&cmd.host)?;
             let target = exec::ssh_target_from_host(&host);
             let client = ProcessSshClient::new();
+            let spinner = CliSpinner::new(use_progress_unconditional(), &format!("Nginx 状态扫描 ({})", host.id));
             let report = scan_nginx_status(&client, &target)
                 .map_err(|e| CliError::InvalidInput(format!("nginx scan failed: {e}")))?;
+            spinner.finish_and_clear();
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
@@ -2318,7 +2370,12 @@ fn get_container_logs(
 }
 
 fn run_repl() -> Result<(), CliError> {
-    let mut input = String::new();
+    ColorMode::Auto.init();
+    let history_path = config::agus_home()?.join("cli_repl_history");
+    let mut rl = Editor::<ReplHelper, DefaultHistory>::new()
+        .map_err(|err| CliError::Config(format!("failed to initialize repl: {err}")))?;
+    rl.set_helper(Some(ReplHelper));
+    let _ = rl.load_history(&history_path);
     let mut llm_provider: Option<Box<dyn llm::LlmProvider>> = None;
     loop {
         let ctx = context::load_context()?;
@@ -2326,18 +2383,31 @@ fn run_repl() -> Result<(), CliError> {
             Some(host) => format!("agus@{host}> "),
             None => "agus> ".to_string(),
         };
-        print!("{prompt}");
-        io::stdout().flush()?;
-        input.clear();
-        if io::stdin().read_line(&mut input)? == 0 {
-            break;
-        }
-        let line = input.trim();
+        let line = match rl.readline(&prompt) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(err) => {
+                return Err(CliError::Config(format!("repl read error: {err}")));
+            }
+        };
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        let _ = rl.add_history_entry(line);
         if matches!(line, "exit" | "quit") {
             break;
+        }
+        if let Some(host_id) = ctx.current_host.as_deref() {
+            let _ = terminal_history::append_terminal_history(terminal_history::TerminalHistoryEntry {
+                host_id: host_id.to_string(),
+                command: line.to_string(),
+                cwd: None,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                source: "cli_repl".to_string(),
+                use_count: 1,
+            });
         }
         let (force_local, command_line) = if let Some(rest) = line.strip_prefix(":local ") {
             (true, rest.trim())
@@ -2406,6 +2476,7 @@ fn run_repl() -> Result<(), CliError> {
             eprintln!("error: {err}");
         }
     }
+    let _ = rl.save_history(&history_path);
     Ok(())
 }
 
@@ -3416,3 +3487,62 @@ agus-mode-off() {
   unset -f __agus_exec_tty 2>/dev/null
 }
 "#;
+
+#[derive(Default)]
+struct ReplHelper;
+
+impl Helper for ReplHelper {}
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let word = &line[start..pos];
+        if word.is_empty() {
+            return Ok((start, Vec::new()));
+        }
+
+        let mut candidates = Vec::new();
+        const CMDS: &[&str] = &[
+            "host", "exec", "context", "ssh", "plan", "deploy", "logs", "monitor", "alert",
+            "container", "security", "diagnose", "exit", "quit", ":local", "!",
+        ];
+        for cmd in CMDS {
+            if cmd.starts_with(word) {
+                candidates.push(Pair {
+                    display: cmd.to_string(),
+                    replacement: cmd.to_string(),
+                });
+            }
+        }
+        if let Ok(hosts) = hosts::load_hosts() {
+            for host in hosts {
+                if host.id.starts_with(word) {
+                    candidates.push(Pair {
+                        display: host.id.clone(),
+                        replacement: host.id,
+                    });
+                }
+            }
+        }
+        Ok((start, candidates))
+    }
+}
+
+impl Hinter for ReplHelper {
+    type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Highlighter for ReplHelper {}
+
+impl Validator for ReplHelper {}

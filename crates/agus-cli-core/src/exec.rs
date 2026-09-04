@@ -3,6 +3,7 @@ use std::process::Command;
 use agus_core_domain::Host;
 use agus_ssh::{ProcessSshClient, SshClient, SshOutputStream, SshTarget};
 
+use crate::host_password::resolve_host_password;
 use crate::CliError;
 
 #[derive(Debug, Clone)]
@@ -15,10 +16,10 @@ pub struct ExecOutput {
 pub fn ssh_target_from_host(host: &Host) -> SshTarget {
     SshTarget {
         host: host.address.clone(),
-        user: host.user.clone(),
+        user: host.user.to_lowercase(),
         port: host.port,
         identity_file: host.identity_file.as_ref().map(|p| p.into()),
-        password: host.password.clone(),
+        password: resolve_host_password(&host.id, host.password.as_deref()),
     }
 }
 

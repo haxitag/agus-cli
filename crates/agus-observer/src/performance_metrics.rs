@@ -328,6 +328,25 @@ fn collect_network_metrics<C: SshClient>(
     Ok(NetworkMetrics { interfaces })
 }
 
+/// 网络错误率（百分比）：(rx_errors + tx_errors) / (rx_packets + tx_packets) * 100
+pub fn compute_network_error_rate(network: &NetworkMetrics) -> Option<f64> {
+    let total_packets: u64 = network
+        .interfaces
+        .iter()
+        .map(|iface| iface.rx_packets + iface.tx_packets)
+        .sum();
+    let total_errors: u64 = network
+        .interfaces
+        .iter()
+        .map(|iface| iface.rx_errors + iface.tx_errors)
+        .sum();
+    if total_packets == 0 {
+        None
+    } else {
+        Some((total_errors as f64 / total_packets as f64) * 100.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +356,26 @@ mod tests {
         assert_eq!(parse_size_to_gb("100G"), 100.0);
         assert_eq!(parse_size_to_gb("1T"), 1024.0);
         assert_eq!(parse_size_to_gb("512M"), 512.0 / 1024.0);
+    }
+
+    #[test]
+    fn test_compute_network_error_rate() {
+        assert_eq!(
+            compute_network_error_rate(&NetworkMetrics { interfaces: vec![] }),
+            None
+        );
+        let metrics = NetworkMetrics {
+            interfaces: vec![NetworkInterface {
+                name: "eth0".into(),
+                rx_bytes: 0,
+                tx_bytes: 0,
+                rx_packets: 90,
+                tx_packets: 10,
+                rx_errors: 4,
+                tx_errors: 1,
+            }],
+        };
+        let rate = compute_network_error_rate(&metrics).unwrap();
+        assert!((rate - 5.0).abs() < 1e-9);
     }
 }

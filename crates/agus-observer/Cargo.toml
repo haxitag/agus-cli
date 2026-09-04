@@ -7,5 +7,7 @@ edition = "2021"
 agus-core-domain = { path = "../agus-core-domain" }
 agus-ssh = { path = "../agus-ssh" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
 chrono = "0.4"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }

@@ -513,19 +513,58 @@ impl ExecutionSession {
     }
 
     pub fn run(&mut self) -> Result<Vec<ExecutionRecord>, ExecutionError> {
-        self.run_until_pause()?;
+        self.run_until_pause(false)?;
         Ok(self.records.clone())
+    }
+
+    /// 逐步执行：每完成一步或进入 WaitingApproval 即暂停。
+    pub fn run_one_step(&mut self) -> Result<Vec<ExecutionRecord>, ExecutionError> {
+        self.run_until_pause(true)?;
+        Ok(self.records.clone())
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.halted || self.index >= self.order.len()
+    }
+
+    pub fn pending_approval_step(&self) -> Option<String> {
+        self.records
+            .iter()
+            .rev()
+            .find(|r| r.status == ExecutionStatus::WaitingApproval)
+            .map(|r| r.step_id.clone())
+            .or_else(|| {
+                if self.index < self.order.len() {
+                    let id = &self.order[self.index];
+                    if self.statuses.get(id) == Some(&ExecutionStatus::WaitingApproval) {
+                        return Some(id.clone());
+                    }
+                }
+                None
+            })
+    }
+
+    pub fn last_record(&self) -> Option<&ExecutionRecord> {
+        self.records.last()
+    }
+
+    pub fn records(&self) -> &[ExecutionRecord] {
+        &self.records
     }
 
     pub fn approve_step(&mut self, step_id: &str) -> Result<Vec<ExecutionRecord>, ExecutionError> {
         self.resolve_approval(step_id, ApprovalDecision::Approved)?;
-        self.run_until_pause()?;
+        self.run_until_pause(false)?;
         Ok(self.records.clone())
     }
 
     pub fn reject_step(&mut self, step_id: &str) -> Result<Vec<ExecutionRecord>, ExecutionError> {
         self.resolve_approval(step_id, ApprovalDecision::Rejected)?;
-        self.run_until_pause()?;
+        self.run_until_pause(false)?;
         Ok(self.records.clone())
     }
 
@@ -590,7 +629,7 @@ impl ExecutionSession {
         }
     }
 
-    fn run_until_pause(&mut self) -> Result<(), ExecutionError> {
+    fn run_until_pause(&mut self, pause_after_each_step: bool) -> Result<(), ExecutionError> {
         while self.index < self.order.len() {
             if self.halted {
                 break;
@@ -634,6 +673,9 @@ impl ExecutionSession {
                 self.statuses
                     .insert(step_id.clone(), ExecutionStatus::Skipped);
                 self.index = self.index.saturating_add(1);
+                if pause_after_each_step {
+                    break;
+                }
                 continue;
             }
 
@@ -687,6 +729,9 @@ impl ExecutionSession {
             self.index = self.index.saturating_add(1);
             if failed {
                 self.halted = true;
+                break;
+            }
+            if pause_after_each_step {
                 break;
             }
         }
@@ -919,14 +964,15 @@ impl ExecutionSession {
             }
             ExecutionMode::SshReadonly { host, client } => match &step.action {
                 DeploymentAction::RunSshCommand { command } => {
+                    if is_agus_stub_command(command) {
+                        return invalid_action_outcome(
+                            "refusing to execute Agus stub script (AGUS_SCRIPT_KIND=stub); replace with a real script",
+                        );
+                    }
                     let target = host_target(host);
                     run_ssh_command(client.as_ref(), &target, command)
                 }
-                _ => StepOutcome {
-                    status: ExecutionStatus::Succeeded,
-                    logs: Vec::new(),
-                    error: None,
-                },
+                other => unsupported_mode_action("ssh_readonly", other),
             },
             ExecutionMode::DockerReadonly { host, client } => match &step.action {
                 DeploymentAction::DockerPs => {
@@ -949,11 +995,7 @@ impl ExecutionSession {
                         Err(message) => invalid_action_outcome(&message),
                     }
                 }
-                _ => StepOutcome {
-                    status: ExecutionStatus::Succeeded,
-                    logs: Vec::new(),
-                    error: None,
-                },
+                other => unsupported_mode_action("docker_readonly", other),
             },
             ExecutionMode::Compose { host, client } => match &step.action {
                 DeploymentAction::ComposeUp { project_dir } => {
@@ -982,11 +1024,22 @@ impl ExecutionSession {
                         Err(message) => invalid_action_outcome(&message),
                     }
                 }
-                _ => StepOutcome {
-                    status: ExecutionStatus::Succeeded,
-                    logs: Vec::new(),
-                    error: None,
-                },
+                DeploymentAction::RunSshCommand { command } => {
+                    if is_agus_stub_command(command) {
+                        return invalid_action_outcome(
+                            "refusing to execute Agus stub script (AGUS_SCRIPT_KIND=stub); replace with a real script",
+                        );
+                    }
+                    let target = host_target(host);
+                    run_ssh_command_with_log(
+                        client.as_ref(),
+                        &target,
+                        command,
+                        self.log_stream.as_ref(),
+                        &step.id,
+                    )
+                }
+                other => unsupported_mode_action("compose", other),
             },
             ExecutionMode::Nginx {
                 host,
@@ -1011,11 +1064,7 @@ impl ExecutionSession {
                         Err(message) => invalid_action_outcome(&message),
                     }
                 }
-                _ => StepOutcome {
-                    status: ExecutionStatus::Succeeded,
-                    logs: Vec::new(),
-                    error: None,
-                },
+                other => unsupported_mode_action("nginx", other),
             },
             ExecutionMode::Ssl {
                 host,
@@ -1034,11 +1083,7 @@ impl ExecutionSession {
                     Some(config) => execute_ssl_rollback(client.as_ref(), host, config),
                     None => invalid_action_outcome("missing ssl project config"),
                 },
-                _ => StepOutcome {
-                    status: ExecutionStatus::Succeeded,
-                    logs: Vec::new(),
-                    error: None,
-                },
+                other => unsupported_mode_action("ssl", other),
             },
             ExecutionMode::DbMigration {
                 host,
@@ -1049,11 +1094,7 @@ impl ExecutionSession {
                     Some(migration) => execute_db_migration(client.as_ref(), host, migration),
                     None => invalid_action_outcome("missing db migration plan"),
                 },
-                _ => StepOutcome {
-                    status: ExecutionStatus::Succeeded,
-                    logs: Vec::new(),
-                    error: None,
-                },
+                other => unsupported_mode_action("db_migration", other),
             },
         }
     }
@@ -1240,6 +1281,23 @@ fn invalid_action_outcome(message: &str) -> StepOutcome {
         logs: vec![format!("error: {message}")],
         error: Some(message.to_string()),
     }
+}
+
+/// Agus Forge 占位脚本标记（与 agus-forge-handoff::is_agus_stub_script 对齐）
+fn is_agus_stub_command(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    content.contains("AGUS_SCRIPT_KIND=stub")
+        || content.contains("# Agus stub")
+        || lower.contains("agus stub from forge")
+        || lower.contains("[build] stub")
+        || lower.contains("[deploy.dev] stub")
+        || lower.contains("[deploy.prod] stub")
+}
+
+fn unsupported_mode_action(mode: &str, action: &DeploymentAction) -> StepOutcome {
+    invalid_action_outcome(&format!(
+        "action {action:?} is not supported in {mode} mode (refusing silent success)"
+    ))
 }
 
 fn build_docker_inspect_command(target: &str) -> Result<String, String> {
@@ -3417,130 +3475,166 @@ impl LLMDrivenExecutionSession {
         }
     }
 
-    /// 运行 LLM 驱动的执行循环
-    /// 这个函数会在执行过程中调用 LLM 进行分析，并根据 LLM 的建议决定下一步行动
-    pub fn run_with_llm_analysis(&mut self) -> Result<Vec<ExecutionRecord>, ExecutionError> {
-        // 如果 LLM provider 不可用，回退到普通执行
-        if self.llm_provider.is_none() {
-            return self.session.run();
-        }
+    pub fn into_session(self) -> ExecutionSession {
+        self.session
+    }
 
-        // 克隆 LLM provider 的 Arc，避免借用冲突
-        let llm_provider = self.llm_provider.as_ref().unwrap().clone();
+    pub fn session_mut(&mut self) -> &mut ExecutionSession {
+        &mut self.session
+    }
+
+    /// 逐步执行真实步骤；每步后可选调用 LLM 分析。
+    /// - WaitingApproval：暂停返回（由 UI `approve_step` 继续）
+    /// - should_rollback：对最近成功步骤尝试 rollback，并返回错误
+    /// - 需人工审批的推荐动作：写入日志后暂停返回
+    pub fn run_with_llm_analysis(&mut self) -> Result<Vec<ExecutionRecord>, ExecutionError> {
+        let Some(provider) = self.llm_provider.clone() else {
+            return self.session.run();
+        };
 
         loop {
-            // 1. 执行当前步骤
-            let step_result = self.execute_current_step()?;
-            self.execution_logs.extend(step_result.logs.clone());
+            self.session.run_one_step()?;
 
-            // 2. 收集执行状态
-            let execution_state = self.collect_execution_state()?;
-
-            // 3. 构建 LLM 分析 Prompt
-            let prompt = build_execution_analysis_prompt(&execution_state)?;
-
-            // 4. 调用 LLM 分析
-            let llm_response = llm_provider.complete_prompt(&prompt).map_err(|e| {
-                ExecutionError::SessionError {
-                    message: format!("LLM analysis failed: {}", e),
-                }
-            })?;
-
-            // 5. 解析 LLM 响应
-            let analysis = parse_llm_execution_response(&llm_response)?;
-
-            // 6. 发送到日志流（先克隆避免借用冲突）
-            {
-                let log_stream_clone = self.session.log_stream.clone();
-                if let Some(ref stream) = log_stream_clone {
-                    stream.info(
-                        "llm_analysis",
-                        &format!(
-                            "LLM 分析: {}\n建议行动数: {}",
-                            analysis.status_analysis.summary,
-                            analysis.action_plan.recommended_actions.len()
-                        ),
+            if let Some(step_id) = self.session.pending_approval_step() {
+                if let Some(stream) = &self.session.log_stream {
+                    stream.warning(
+                        &step_id,
+                        &format!("Paused for approval on step {step_id}"),
                     );
                 }
+                return Ok(self.session.records.clone());
             }
 
-            // 7. 根据 LLM 分析决定下一步
+            if self.session.is_complete() {
+                break;
+            }
+
+            let Some(last) = self.session.last_record().cloned() else {
+                break;
+            };
+            self.execution_logs
+                .extend(last.logs.iter().cloned().take(40));
+
+            let state = self.collect_execution_state_from_session(&last)?;
+            let prompt = build_execution_analysis_prompt(&state)?;
+            let raw = provider.complete_prompt(&prompt).map_err(|e| {
+                ExecutionError::SessionError {
+                    message: format!("LLM analysis failed: {e}"),
+                }
+            })?;
+            let analysis = parse_llm_execution_response(&raw)?;
+
+            if let Some(stream) = &self.session.log_stream {
+                stream.info(
+                    &last.step_id,
+                    &format!(
+                        "LLM analysis: {} — {}",
+                        analysis.status_analysis.current_status, analysis.status_analysis.summary
+                    ),
+                );
+            }
+
             if analysis.action_plan.should_rollback {
+                let target = self
+                    .session
+                    .records
+                    .iter()
+                    .rev()
+                    .find(|r| r.status == ExecutionStatus::Succeeded)
+                    .map(|r| r.step_id.clone());
+                if let Some(step_id) = target {
+                    let _ = self.session.rollback_step(&step_id);
+                }
                 return Err(ExecutionError::SessionError {
-                    message: format!("LLM 建议回滚: {}", analysis.problem_diagnosis.root_cause),
+                    message: format!(
+                        "LLM recommended rollback after step {}: {}",
+                        last.step_id, analysis.problem_diagnosis.root_cause
+                    ),
                 });
             }
 
-            if !analysis.action_plan.should_continue {
-                // LLM 建议停止执行
-                break;
-            }
-
-            // 8. 执行建议的行动（需要审批的行动会在后续实现中处理）
-            {
-                let log_stream_clone = self.session.log_stream.clone();
-                for action in &analysis.action_plan.recommended_actions {
-                    if action.requires_approval {
-                        // TODO: 等待用户审批（P1 功能）
-                        if let Some(ref stream) = log_stream_clone {
-                            stream.warning(
-                                "approval_required",
-                                &format!("行动 {} 需要审批: {}", action.id, action.description),
-                            );
-                        }
-                        // 暂时跳过需要审批的行动
-                        continue;
-                    }
-
-                    // 执行不需要审批的行动
-                    if let Some(ref stream) = log_stream_clone {
-                        stream.info(
-                            "action_executed",
-                            &format!("执行行动 {}: {}", action.id, action.description),
-                        );
-                    }
+            let needs_human = analysis
+                .action_plan
+                .recommended_actions
+                .iter()
+                .any(|a| a.requires_approval);
+            if needs_human {
+                if let Some(stream) = &self.session.log_stream {
+                    stream.warning(
+                        &last.step_id,
+                        "LLM recommended actions require human approval; pausing execution",
+                    );
                 }
+                return Ok(self.session.records.clone());
             }
 
-            // 9. 检查是否完成
-            if self.is_deployment_complete(&analysis)? {
-                break;
+            if !analysis.action_plan.should_continue {
+                if let Some(stream) = &self.session.log_stream {
+                    stream.warning(
+                        &last.step_id,
+                        "LLM advised stopping further steps; pausing execution",
+                    );
+                }
+                return Ok(self.session.records.clone());
             }
-
-            // 10. 更新到下一步
-            self.advance_to_next_step(&analysis)?;
         }
 
-        // 返回执行记录
         Ok(self.session.records.clone())
     }
 
-    /// 执行当前步骤
-    fn execute_current_step(&mut self) -> Result<StepOutcome, ExecutionError> {
-        // 使用原有的 ExecutionSession 逻辑执行步骤
-        // 这里简化实现，实际应该调用 session.run() 的逻辑
-        // TODO: 集成到 ExecutionSession 的执行逻辑中
-        // 暂时返回一个成功的结果
-        Ok(StepOutcome {
-            status: ExecutionStatus::Succeeded,
-            logs: vec!["Step executed".to_string()],
-            error: None,
-        })
-    }
+    fn collect_execution_state_from_session(
+        &self,
+        last: &ExecutionRecord,
+    ) -> Result<ExecutionState, ExecutionError> {
+        let status = match last.status {
+            ExecutionStatus::Succeeded => "succeeded",
+            ExecutionStatus::Failed => "failed",
+            ExecutionStatus::WaitingApproval => "waiting_approval",
+            ExecutionStatus::Skipped => "skipped",
+            ExecutionStatus::RolledBack => "rolled_back",
+            ExecutionStatus::Running => "running",
+            ExecutionStatus::Pending => "pending",
+        };
+        let completed: Vec<CompletedStepInfo> = self
+            .session
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    ExecutionStatus::Succeeded | ExecutionStatus::RolledBack | ExecutionStatus::Skipped
+                )
+            })
+            .map(|r| CompletedStepInfo {
+                id: r.step_id.clone(),
+                service_name: r.step_id.clone(),
+                status: format!("{:?}", r.status),
+                duration: "-".to_string(),
+            })
+            .collect();
+        let pending: Vec<PendingStepInfo> = self
+            .session
+            .order
+            .iter()
+            .skip(self.session.index)
+            .filter_map(|id| {
+                self.session.steps_by_id.get(id).map(|step| PendingStepInfo {
+                    id: id.clone(),
+                    service_name: step.service_name.clone(),
+                    description: step.memo.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
 
-    /// 收集执行状态
-    fn collect_execution_state(&self) -> Result<ExecutionState, ExecutionError> {
-        // TODO: 从 session 中收集实际的状态信息
-        // 这里先返回一个示例状态
         Ok(ExecutionState {
             execution_id: self.execution_id.clone(),
             project_name: self.project_name.clone(),
             current_step: CurrentStepInfo {
-                id: "step_1".to_string(),
-                service_name: "service".to_string(),
-                command: "command".to_string(),
-                status: "running".to_string(),
-                step_start_time: "".to_string(),
+                id: last.step_id.clone(),
+                service_name: last.step_id.clone(),
+                command: last.logs.first().cloned().unwrap_or_default(),
+                status: status.to_string(),
+                step_start_time: "-".to_string(),
             },
             execution_logs: self.execution_logs.clone(),
             system_metrics: SystemMetrics {
@@ -3549,28 +3643,10 @@ impl LLMDrivenExecutionSession {
                 disk_usage: 0.0,
             },
             container_status: Vec::new(),
-            completed_steps: Vec::new(),
-            pending_steps: Vec::new(),
-            start_time: self.start_time.elapsed().as_secs().to_string(),
-            elapsed_time: self.start_time.elapsed().as_secs().to_string(),
+            completed_steps: completed,
+            pending_steps: pending,
+            start_time: "-".to_string(),
+            elapsed_time: format!("{:.1}s", self.start_time.elapsed().as_secs_f64()),
         })
-    }
-
-    /// 检查部署是否完成
-    fn is_deployment_complete(
-        &self,
-        analysis: &LLMExecutionAnalysis,
-    ) -> Result<bool, ExecutionError> {
-        // 如果所有步骤都完成，或者 LLM 建议停止
-        Ok(!analysis.action_plan.should_continue)
-    }
-
-    /// 推进到下一步
-    fn advance_to_next_step(
-        &mut self,
-        _analysis: &LLMExecutionAnalysis,
-    ) -> Result<(), ExecutionError> {
-        // TODO: 更新 session 的状态，推进到下一步
-        Ok(())
     }
 }

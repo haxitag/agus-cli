@@ -197,6 +197,22 @@ fn build_control_config(
     })
 }
 
+/// 供交互式终端与命令执行共享 ControlMaster 套接字，避免重复 TCP 连接与 session 耗尽。
+#[derive(Debug, Clone)]
+pub struct SshMultiplexConfig {
+    pub control_path: PathBuf,
+    pub persist_secs: u64,
+}
+
+pub fn ssh_multiplex_config_for(target: &SshTarget, persist: Duration) -> Option<SshMultiplexConfig> {
+    let base = ssh_control_base_dir()?;
+    let control = build_control_config(base, target, persist)?;
+    Some(SshMultiplexConfig {
+        control_path: control.path,
+        persist_secs: control.persist.as_secs(),
+    })
+}
+
 pub trait SshClient {
     fn execute(&self, target: &SshTarget, command: &str) -> Result<SshCommandResult, SshError>;
 
@@ -572,6 +588,8 @@ impl ProcessSshClient {
                 .arg("-o")
                 .arg("StrictHostKeyChecking=accept-new")
                 .arg("-o")
+                .arg("LogLevel=ERROR")
+                .arg("-o")
                 .arg(format!(
                     "ConnectTimeout={}",
                     self.config.connect_timeout.as_secs()
@@ -716,6 +734,8 @@ impl ProcessSshClient {
                 .arg("NumberOfPasswordPrompts=1")
                 .arg("-o")
                 .arg("StrictHostKeyChecking=accept-new")
+                .arg("-o")
+                .arg("LogLevel=ERROR")
                 .arg("-o")
                 .arg(format!(
                     "ConnectTimeout={}",
@@ -884,6 +904,8 @@ impl ProcessSshClient {
                 .arg("NumberOfPasswordPrompts=1")
                 .arg("-o")
                 .arg("StrictHostKeyChecking=accept-new")
+                .arg("-o")
+                .arg("LogLevel=ERROR")
                 .arg("-o")
                 .arg(format!(
                     "ConnectTimeout={}",
@@ -1129,22 +1151,13 @@ impl SshConnectionPool {
         format!("{}@{}:{}", target.user, target.host, target.port)
     }
 
-    /// 检查连接是否健康
+    /// 检查连接是否健康（仅检测 ControlMaster，避免额外占用 MaxSessions）
     pub fn check_connection_health(&self, target: &SshTarget) -> bool {
         let control = self.control_config_for(target);
         if let Some(control) = control.as_ref() {
-            if self.client.control_master_active(target, control) {
-                return true;
-            }
+            return self.client.control_master_active(target, control);
         }
-        // 执行一个简单的命令来测试连接
-        match self
-            .client
-            .execute_with_control(target, "echo 'health_check'", control.as_ref())
-        {
-            Ok(result) => result.exit_code == 0,
-            Err(_) => false,
-        }
+        false
     }
 
     /// 获取或创建连接

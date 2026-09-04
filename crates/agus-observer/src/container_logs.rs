@@ -1,6 +1,9 @@
-use agus_ssh::{SshClient, SshTarget};
+use agus_ssh::{SshClient, SshOutputStream, SshTarget};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,7 +31,7 @@ pub enum LogStream {
 }
 
 pub trait ContainerLogMonitor: Send + Sync {
-    /// Start monitoring container logs
+    /// Start background follow (`docker logs -f`) for a container.
     fn start_monitoring(
         &self,
         container_id: &str,
@@ -36,10 +39,10 @@ pub trait ContainerLogMonitor: Send + Sync {
         until: Option<u64>,
     ) -> Result<(), ContainerLogError>;
 
-    /// Stop monitoring container logs
+    /// Stop background follow for a container.
     fn stop_monitoring(&self, container_id: &str) -> Result<(), ContainerLogError>;
 
-    /// Get recent logs for a container
+    /// Get recent logs for a container (one-shot).
     fn get_logs(
         &self,
         container_id: &str,
@@ -47,10 +50,16 @@ pub trait ContainerLogMonitor: Send + Sync {
         since: Option<u64>,
     ) -> Result<Vec<ContainerLogEntry>, ContainerLogError>;
 
-    /// Stream logs in real-time (callback-based)
+    /// Bounded follow (≤ ~20s). Prefer `start_monitoring` + `poll_monitoring` for long sessions.
     fn stream_logs<F>(&self, container_id: &str, callback: F) -> Result<(), ContainerLogError>
     where
         F: Fn(ContainerLogEntry) + Send + Sync + 'static;
+
+    /// Drain buffered lines from an active `start_monitoring` session.
+    fn poll_monitoring(&self, container_id: &str) -> Result<Vec<ContainerLogEntry>, ContainerLogError>;
+
+    /// Whether a background follow session is active for this container.
+    fn is_monitoring(&self, container_id: &str) -> bool;
 }
 
 #[derive(Debug)]
@@ -59,28 +68,211 @@ pub enum ContainerLogError {
     ContainerNotFound { container_id: String },
     ParseError { message: String },
     IoError { message: String },
+    AlreadyRunning { container_id: String },
+    NotRunning { container_id: String },
 }
 
 impl std::fmt::Display for ContainerLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContainerLogError::SshError { message } => {
-                write!(f, "SSH error: {}", message)
-            }
+            ContainerLogError::SshError { message } => write!(f, "SSH error: {message}"),
             ContainerLogError::ContainerNotFound { container_id } => {
-                write!(f, "Container not found: {}", container_id)
+                write!(f, "Container not found: {container_id}")
             }
-            ContainerLogError::ParseError { message } => {
-                write!(f, "Parse error: {}", message)
+            ContainerLogError::ParseError { message } => write!(f, "Parse error: {message}"),
+            ContainerLogError::IoError { message } => write!(f, "IO error: {message}"),
+            ContainerLogError::AlreadyRunning { container_id } => {
+                write!(f, "log follow already running for {container_id}")
             }
-            ContainerLogError::IoError { message } => {
-                write!(f, "IO error: {}", message)
+            ContainerLogError::NotRunning { container_id } => {
+                write!(f, "no active log follow for {container_id}")
             }
         }
     }
 }
 
 impl std::error::Error for ContainerLogError {}
+
+const FOLLOW_BUFFER_CAP: usize = 2000;
+
+struct FollowSession {
+    stop: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<ContainerLogEntry>>>,
+    target: SshTarget,
+}
+
+/// Process-wide follow sessions shared by CLI trait + Tauri UI.
+pub struct ContainerLogFollowRegistry {
+    sessions: Mutex<HashMap<String, FollowSession>>,
+}
+
+impl ContainerLogFollowRegistry {
+    pub fn global() -> &'static Self {
+        static REGISTRY: OnceLock<ContainerLogFollowRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(|| Self {
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn session_key(target: &SshTarget, container_id: &str) -> String {
+        format!(
+            "{}@{}:{}::{container_id}",
+            target.user, target.host, target.port
+        )
+    }
+
+    pub fn start(
+        &self,
+        client: Arc<dyn SshClient + Send + Sync>,
+        target: SshTarget,
+        container_id: String,
+        since: Option<u64>,
+        _until: Option<u64>,
+    ) -> Result<(), ContainerLogError> {
+        let key = Self::session_key(&target, &container_id);
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| ContainerLogError::IoError {
+                    message: e.to_string(),
+                })?;
+            if sessions.contains_key(&key) {
+                return Err(ContainerLogError::AlreadyRunning {
+                    container_id: container_id.clone(),
+                });
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| ContainerLogError::IoError {
+                    message: e.to_string(),
+                })?;
+            sessions.insert(
+                key.clone(),
+                FollowSession {
+                    stop: stop.clone(),
+                    buffer: buffer.clone(),
+                    target: target.clone(),
+                },
+            );
+        }
+
+        let container_for_thread = container_id.clone();
+        let manager_key = key.clone();
+        thread::spawn(move || {
+            let since_arg = since
+                .map(|ts| format!("--since={ts}"))
+                .unwrap_or_default();
+            let container_arg = escape_shell_arg(&container_for_thread);
+            let cmd = format!(
+                "docker logs --tail=50 {since_arg} -f --timestamps -- {container_arg} 2>&1"
+            );
+            let mut on_output = |stream: SshOutputStream, line: &str| {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(entry) = parse_docker_log_line(line, &container_for_thread) {
+                    let mut entry = entry;
+                    entry.stream = match stream {
+                        SshOutputStream::Stdout => LogStream::Stdout,
+                        SshOutputStream::Stderr => LogStream::Stderr,
+                    };
+                    if let Ok(mut buf) = buffer.lock() {
+                        if buf.len() >= FOLLOW_BUFFER_CAP {
+                            let drop_n = buf.len() - FOLLOW_BUFFER_CAP + 1;
+                            buf.drain(0..drop_n);
+                        }
+                        buf.push(entry);
+                    }
+                }
+            };
+            let _ = client.execute_streaming(&target, &cmd, &mut on_output);
+            if let Ok(mut sessions) = ContainerLogFollowRegistry::global().sessions.lock() {
+                sessions.remove(&manager_key);
+            }
+        });
+
+        Ok(())
+    }
+
+    pub fn stop(&self, target: &SshTarget, container_id: &str) -> Result<(), ContainerLogError> {
+        let key = Self::session_key(target, container_id);
+        let (stop_flag, kill_target) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| ContainerLogError::IoError {
+                    message: e.to_string(),
+                })?;
+            match sessions.get(&key) {
+                Some(session) => (session.stop.clone(), session.target.clone()),
+                None => {
+                    return Err(ContainerLogError::NotRunning {
+                        container_id: container_id.to_string(),
+                    });
+                }
+            }
+        };
+        stop_flag.store(true, Ordering::SeqCst);
+
+        // Best-effort: terminate remote `docker logs -f` so the SSH stream ends.
+        let client = agus_ssh::ProcessSshClient::new();
+        let container_arg = escape_shell_arg(container_id);
+        let kill_cmd = format!(
+            "pkill -f \"docker logs .*-- {container_arg}\" 2>/dev/null || pkill -f \"docker logs .*{container_id}\" 2>/dev/null || true"
+        );
+        let _ = client.execute(&kill_target, &kill_cmd);
+        Ok(())
+    }
+
+    pub fn poll(
+        &self,
+        target: &SshTarget,
+        container_id: &str,
+    ) -> Result<Vec<ContainerLogEntry>, ContainerLogError> {
+        let key = Self::session_key(target, container_id);
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| ContainerLogError::IoError {
+                message: e.to_string(),
+            })?;
+        let Some(session) = sessions.get(&key) else {
+            return Ok(Vec::new());
+        };
+        let mut buf = session
+            .buffer
+            .lock()
+            .map_err(|e| ContainerLogError::IoError {
+                message: e.to_string(),
+            })?;
+        Ok(std::mem::take(&mut *buf))
+    }
+
+    pub fn is_active(&self, target: &SshTarget, container_id: &str) -> bool {
+        let key = Self::session_key(target, container_id);
+        self.sessions
+            .lock()
+            .map(|s| s.contains_key(&key))
+            .unwrap_or(false)
+    }
+
+    /// Host-id keyed helpers for Tauri (maps host_id → target via caller).
+    pub fn start_for_target(
+        &self,
+        client: Arc<dyn SshClient + Send + Sync>,
+        target: SshTarget,
+        container_id: String,
+    ) -> Result<(), ContainerLogError> {
+        self.start(client, target, container_id, None, None)
+    }
+}
 
 pub struct SshContainerLogMonitor {
     client: Arc<dyn SshClient + Send + Sync>,
@@ -91,24 +283,30 @@ impl SshContainerLogMonitor {
     pub fn new(client: Arc<dyn SshClient + Send + Sync>, target: SshTarget) -> Self {
         Self { client, target }
     }
+
+    pub fn target(&self) -> &SshTarget {
+        &self.target
+    }
 }
 
 impl ContainerLogMonitor for SshContainerLogMonitor {
     fn start_monitoring(
         &self,
-        _container_id: &str,
-        _since: Option<u64>,
-        _until: Option<u64>,
+        container_id: &str,
+        since: Option<u64>,
+        until: Option<u64>,
     ) -> Result<(), ContainerLogError> {
-        Err(ContainerLogError::SshError {
-            message: "持续日志监控未实现：请使用 get_logs / 一次性拉取，勿假装已启动监控".to_string(),
-        })
+        ContainerLogFollowRegistry::global().start(
+            self.client.clone(),
+            self.target.clone(),
+            container_id.to_string(),
+            since,
+            until,
+        )
     }
 
-    fn stop_monitoring(&self, _container_id: &str) -> Result<(), ContainerLogError> {
-        Err(ContainerLogError::SshError {
-            message: "持续日志监控未实现：无后台监控任务可停止".to_string(),
-        })
+    fn stop_monitoring(&self, container_id: &str) -> Result<(), ContainerLogError> {
+        ContainerLogFollowRegistry::global().stop(&self.target, container_id)
     }
 
     fn get_logs(
@@ -117,22 +315,19 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
         lines: Option<usize>,
         since: Option<u64>,
     ) -> Result<Vec<ContainerLogEntry>, ContainerLogError> {
-        let lines_arg = lines.map(|n| format!("--tail={}", n)).unwrap_or_default();
+        let lines_arg = lines.map(|n| format!("--tail={n}")).unwrap_or_default();
         let since_arg = since
-            .map(|ts| format!("--since {}", ts))
+            .map(|ts| format!("--since {ts}"))
             .unwrap_or_default();
         let container_arg = escape_shell_arg(container_id);
 
-        let cmd = format!(
-            "docker logs {} {} -- {} 2>&1",
-            lines_arg, since_arg, container_arg
-        );
+        let cmd = format!("docker logs {lines_arg} {since_arg} -- {container_arg} 2>&1");
 
         let result =
             self.client
                 .execute(&self.target, &cmd)
                 .map_err(|e| ContainerLogError::SshError {
-                    message: format!("Failed to execute command: {}", e),
+                    message: format!("Failed to execute command: {e}"),
                 })?;
 
         if result.exit_code != 0 {
@@ -141,7 +336,6 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
             });
         }
 
-        // Parse Docker logs (format: timestamp stream message)
         let mut entries = Vec::new();
         for line in result.stdout.lines() {
             if let Some(entry) = parse_docker_log_line(line, container_id) {
@@ -156,8 +350,7 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
     where
         F: Fn(ContainerLogEntry) + Send + Sync + 'static,
     {
-        // 非持续流：有界 follow（最多约 20s），避免假装常驻 -f 监控。
-        // 优先 timeout(1)；若无 timeout 命令则退回一次性拉取。
+        // Bounded follow for one-shot callers; long sessions use start_monitoring.
         let container_arg = escape_shell_arg(container_id);
         let follow_cmd = format!(
             "(command -v timeout >/dev/null 2>&1 && timeout 20s docker logs --tail=50 -f --timestamps -- {0} 2>&1) || docker logs --tail=100 --timestamps -- {0} 2>&1",
@@ -168,7 +361,7 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
             .client
             .execute(&self.target, &follow_cmd)
             .map_err(|e| ContainerLogError::SshError {
-                message: format!("Failed to execute bounded log follow: {}", e),
+                message: format!("Failed to execute bounded log follow: {e}"),
             })?;
 
         let mut emitted = 0usize;
@@ -179,7 +372,6 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
             }
         }
         if emitted == 0 && result.exit_code != 0 && result.exit_code != 124 {
-            // 124 = timeout 正常结束；其它非零视为失败
             return Err(ContainerLogError::SshError {
                 message: format!(
                     "bounded log follow failed (exit {}): {}",
@@ -190,6 +382,17 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
         }
         Ok(())
     }
+
+    fn poll_monitoring(
+        &self,
+        container_id: &str,
+    ) -> Result<Vec<ContainerLogEntry>, ContainerLogError> {
+        ContainerLogFollowRegistry::global().poll(&self.target, container_id)
+    }
+
+    fn is_monitoring(&self, container_id: &str) -> bool {
+        ContainerLogFollowRegistry::global().is_active(&self.target, container_id)
+    }
 }
 
 fn escape_shell_arg(value: &str) -> String {
@@ -197,42 +400,39 @@ fn escape_shell_arg(value: &str) -> String {
 }
 
 fn parse_docker_log_line(line: &str, container_id: &str) -> Option<ContainerLogEntry> {
-    // Docker log format: "2024-01-01T12:00:00.000000000Z stdout This is a log message"
-    // Or simpler format without timestamp: "This is a log message"
-
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
     let (timestamp, stream, message) = if parts.len() >= 3 {
-        // Try to parse timestamp
-        let _ts_str = parts[0];
         let stream_str = parts[1];
         let msg = parts[2..].join(" ");
-
-        // Try to parse timestamp (simplified - just use current time if parsing fails)
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
-
         let stream = if stream_str == "stdout" {
             LogStream::Stdout
-        } else {
+        } else if stream_str == "stderr" {
             LogStream::Stderr
+        } else {
+            // Timestamp may be first token without stream marker
+            LogStream::Stdout
         };
-
-        (timestamp, stream, msg)
+        let message = if stream_str == "stdout" || stream_str == "stderr" {
+            msg
+        } else {
+            line.to_string()
+        };
+        (timestamp, stream, message)
     } else {
-        // No timestamp, assume current time and stdout
         (
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             LogStream::Stdout,
             line.to_string(),
         )
     };
 
-    // Determine log level from message content
     let level = if message.to_lowercase().contains("error")
         || message.to_lowercase().contains("fatal")
     {
@@ -248,7 +448,7 @@ fn parse_docker_log_line(line: &str, container_id: &str) -> Option<ContainerLogE
 
     Some(ContainerLogEntry {
         container_id: container_id.to_string(),
-        container_name: container_id.to_string(), // Would need to look up actual name
+        container_name: container_id.to_string(),
         timestamp,
         level,
         message,

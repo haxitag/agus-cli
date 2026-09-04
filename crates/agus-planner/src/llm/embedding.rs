@@ -99,20 +99,31 @@ impl EmbeddingProvider for OpenAIEmbeddingProvider {
     }
 }
 
-// Implement LlmProvider trait (placeholder - would use existing OpenAI provider logic)
+// Embedding provider is not a general LLM — refuse chat-style methods instead of fake answers.
 #[async_trait]
 impl LlmProvider for OpenAIEmbeddingProvider {
     async fn diagnose_error(&self, _context: &str) -> Result<String, LlmError> {
-        // Would delegate to existing OpenAI provider
-        Ok("Diagnosis not implemented in embedding provider".to_string())
+        Err(LlmError::ConfigError {
+            message:
+                "OpenAIEmbeddingProvider does not implement diagnose_error; use a chat LLM provider"
+                    .to_string(),
+        })
     }
-    
+
     async fn evaluate_performance(&self, _metrics: &str) -> Result<String, LlmError> {
-        Ok("Performance evaluation not implemented in embedding provider".to_string())
+        Err(LlmError::ConfigError {
+            message:
+                "OpenAIEmbeddingProvider does not implement evaluate_performance; use a chat LLM provider"
+                    .to_string(),
+        })
     }
-    
+
     async fn analyze_dependencies(&self, _graph: &str) -> Result<String, LlmError> {
-        Ok("Dependency analysis not implemented in embedding provider".to_string())
+        Err(LlmError::ConfigError {
+            message:
+                "OpenAIEmbeddingProvider does not implement analyze_dependencies; use a chat LLM provider"
+                    .to_string(),
+        })
     }
 }
 

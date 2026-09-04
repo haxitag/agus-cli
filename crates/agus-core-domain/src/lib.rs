@@ -250,6 +250,8 @@ pub enum ExecutionStatus {
     Running,
     WaitingApproval,
     Succeeded,
+    /// Dry-run / 本地模拟完成：未触达远端，不得与真实 Succeeded 等同展示。
+    Simulated,
     Failed,
     Skipped,
     RolledBack,
@@ -323,6 +325,9 @@ pub struct OpsEvent {
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_id: Option<String>,
+    /// 执行模式：dry_run / compose / ssh_readonly / …；缺省表示历史记录未标注。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +487,65 @@ impl DeploymentPlan {
 
         Ok(())
     }
+
+    /// Convert symbolic DeployService/VerifyService into concrete SSH compose commands.
+    /// Compose executor only supports RunSshCommand / ComposeUp / ComposeDown — never pretend
+    /// DeployService is executable.
+    pub fn materialize_symbolic_compose_actions(&mut self) -> Result<(), String> {
+        for step in &mut self.steps {
+            match &step.action {
+                DeploymentAction::DeployService => {
+                    let service = validate_compose_service_name(&step.service_name)?;
+                    step.action = DeploymentAction::RunSshCommand {
+                        command: format!("docker compose up -d -- {service}"),
+                    };
+                    if step.memo.as_ref().map(|m| m.trim().is_empty()).unwrap_or(true) {
+                        step.memo = Some(format!("部署服务 {service}（docker compose up -d）"));
+                    }
+                }
+                DeploymentAction::VerifyService => {
+                    let service = validate_compose_service_name(&step.service_name)?;
+                    step.action = DeploymentAction::RunSshCommand {
+                        command: format!("docker compose ps -- {service}"),
+                    };
+                    if step.memo.as_ref().map(|m| m.trim().is_empty()).unwrap_or(true) {
+                        step.memo = Some(format!("验证服务 {service}（docker compose ps）"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true when any step is still a symbolic DeployService/VerifyService.
+    pub fn has_symbolic_compose_actions(&self) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(
+                step.action,
+                DeploymentAction::DeployService | DeploymentAction::VerifyService
+            )
+        })
+    }
+}
+
+fn validate_compose_service_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("compose service name is empty".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err(format!("compose service name cannot start with '-': {trimmed}"));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(format!(
+            "compose service name contains unsafe characters: {trimmed}"
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]

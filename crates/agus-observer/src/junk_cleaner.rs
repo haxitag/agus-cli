@@ -307,6 +307,12 @@ pub fn clean_junk_files<C: SshClient>(
     target: &SshTarget,
     item_paths: Vec<String>,
 ) -> Result<(), SshError> {
+    if item_paths.is_empty() {
+        return Err(SshError::Command {
+            exit_code: -1,
+            stderr: "clean_junk_files refused empty item_paths (no-op is not success)".to_string(),
+        });
+    }
     for path in item_paths {
         if path == "/var/cache/apt/archives" {
             client.execute(target, "sudo apt-get clean")?;

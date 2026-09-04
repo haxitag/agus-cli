@@ -329,10 +329,13 @@ impl ProcessSshClient {
             match self.try_execute_with_control(target, command, control) {
                 Ok(result) => return Ok(result),
                 Err(err) => {
+                    // 超时多为远端挂死（如 docker info）；重试只会把卡顿放大数倍
+                    let timed_out = matches!(&err, SshError::Timeout { .. });
                     last_error = Some(err);
-                    if attempt < self.config.max_retries - 1 {
-                        std::thread::sleep(self.config.retry_delay);
+                    if timed_out || attempt + 1 >= self.config.max_retries {
+                        break;
                     }
+                    std::thread::sleep(self.config.retry_delay);
                 }
             }
         }
@@ -351,10 +354,12 @@ impl ProcessSshClient {
             match self.try_execute_streaming_with_control(target, command, on_output, control) {
                 Ok(result) => return Ok(result),
                 Err(err) => {
+                    let timed_out = matches!(&err, SshError::Timeout { .. });
                     last_error = Some(err);
-                    if attempt < self.config.max_retries - 1 {
-                        std::thread::sleep(self.config.retry_delay);
+                    if timed_out || attempt + 1 >= self.config.max_retries {
+                        break;
                     }
+                    std::thread::sleep(self.config.retry_delay);
                 }
             }
         }
@@ -562,9 +567,11 @@ impl ProcessSshClient {
             cmd.arg("-i").arg(identity);
         }
         cmd.arg("-O").arg("check").arg(&destination);
-        cmd.output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        // ControlMaster check 绝不可无限阻塞：socket 僵死时 cmd.output() 会卡死调用线程
+        match self.run_command_with_timeout(cmd, Duration::from_secs(8), "ssh-control-check") {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
     }
 
     fn spawn_control_master(
@@ -636,9 +643,11 @@ impl ProcessSshClient {
             .arg("-f")
             .arg(&destination);
 
-        let output = cmd.output().map_err(|err| SshError::Connection {
-            message: format!("failed to launch control master: {err}"),
-        })?;
+        let output = self.run_command_with_timeout(
+            cmd,
+            Duration::from_secs(15),
+            "ssh-control-master",
+        )?;
         if output.status.success() {
             Ok(())
         } else {
@@ -804,8 +813,12 @@ impl ProcessSshClient {
         // 使用密钥文件或系统默认密钥
         let mut cmd = Command::new("ssh");
 
-        // 添加SSH选项（不使用batch mode，允许交互式输入）
+        // 自动化执行必须 BatchMode：禁止卡在 passphrase/密码交互提示
         cmd.arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("NumberOfPasswordPrompts=0")
+            .arg("-o")
             .arg("StrictHostKeyChecking=accept-new")
             .arg("-o")
             .arg(format!(
@@ -931,8 +944,12 @@ impl ProcessSshClient {
         } else {
             let mut cmd = Command::new("ssh");
 
-            // 添加SSH选项（不使用batch mode）
+            // 自动化流式执行同样禁止交互卡死
             cmd.arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-o")
+                .arg("NumberOfPasswordPrompts=0")
+                .arg("-o")
                 .arg("StrictHostKeyChecking=accept-new")
                 .arg("-o")
                 .arg(format!(
@@ -1061,10 +1078,12 @@ impl SshClient for ProcessSshClient {
             match self.try_execute(target, command) {
                 Ok(result) => return Ok(result),
                 Err(err) => {
+                    let timed_out = matches!(&err, SshError::Timeout { .. });
                     last_error = Some(err);
-                    if attempt < self.config.max_retries - 1 {
-                        std::thread::sleep(self.config.retry_delay);
+                    if timed_out || attempt + 1 >= self.config.max_retries {
+                        break;
                     }
+                    std::thread::sleep(self.config.retry_delay);
                 }
             }
         }
@@ -1084,10 +1103,12 @@ impl SshClient for ProcessSshClient {
             match self.try_execute_streaming(target, command, on_output) {
                 Ok(result) => return Ok(result),
                 Err(err) => {
+                    let timed_out = matches!(&err, SshError::Timeout { .. });
                     last_error = Some(err);
-                    if attempt < self.config.max_retries - 1 {
-                        std::thread::sleep(self.config.retry_delay);
+                    if timed_out || attempt + 1 >= self.config.max_retries {
+                        break;
                     }
+                    std::thread::sleep(self.config.retry_delay);
                 }
             }
         }
@@ -1161,16 +1182,54 @@ impl SshConnectionPool {
     }
 
     /// 获取或创建连接
+    ///
+    /// 注意：绝不在持有 `connections` 锁时做 SSH 网络 I/O。
+    /// 否则并行扫描/监控会把其它线程堵在锁上，表现为「远程扫描一直转圈」。
     pub fn get_connection(&self, target: &SshTarget) -> Result<(), SshError> {
         let connection_id = Self::connection_id(target);
+
+        let tracked = {
+            let mut connections = self.connections.lock().unwrap();
+            if connections.len() >= self.config.max_connections {
+                self.cleanup_idle_connections(&mut connections);
+                if connections.len() >= self.config.max_connections
+                    && !connections.contains_key(&connection_id)
+                {
+                    return Err(SshError::Connection {
+                        message: format!(
+                            "Connection pool is full (max: {})",
+                            self.config.max_connections
+                        ),
+                    });
+                }
+            }
+            connections.contains_key(&connection_id)
+        };
+
+        if tracked {
+            if self.check_connection_health(target) {
+                let mut connections = self.connections.lock().unwrap();
+                if let Some(conn) = connections.get_mut(&connection_id) {
+                    conn.last_used = Instant::now();
+                    conn.is_active = true;
+                    return Ok(());
+                }
+            } else {
+                let mut connections = self.connections.lock().unwrap();
+                connections.remove(&connection_id);
+            }
+        }
+
+        // 网络建连在锁外完成
+        let control = self.control_config_for(target);
+        self.client
+            .execute_with_control(target, "echo 'connection_test'", control.as_ref())?;
+
         let mut connections = self.connections.lock().unwrap();
-
-        // 检查连接池是否已满
-        if connections.len() >= self.config.max_connections {
-            // 清理空闲连接
+        if connections.len() >= self.config.max_connections
+            && !connections.contains_key(&connection_id)
+        {
             self.cleanup_idle_connections(&mut connections);
-
-            // 如果还是满的，返回错误
             if connections.len() >= self.config.max_connections {
                 return Err(SshError::Connection {
                     message: format!(
@@ -1180,38 +1239,14 @@ impl SshConnectionPool {
                 });
             }
         }
-
-        // 检查是否已存在连接
-        if let Some(conn) = connections.get_mut(&connection_id) {
-            // 检查连接是否健康
-            if self.check_connection_health(target) {
-                conn.last_used = Instant::now();
-                conn.is_active = true;
-                return Ok(());
-            } else {
-                // 连接不健康，移除它
-                connections.remove(&connection_id);
-            }
-        }
-
-        // 创建新连接（测试连接）
-        let control = self.control_config_for(target);
-        match self
-            .client
-            .execute_with_control(target, "echo 'connection_test'", control.as_ref())
-        {
-            Ok(_) => {
-                connections.insert(
-                    connection_id,
-                    PooledConnection {
-                        last_used: Instant::now(),
-                        is_active: true,
-                    },
-                );
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        connections.insert(
+            connection_id,
+            PooledConnection {
+                last_used: Instant::now(),
+                is_active: true,
+            },
+        );
+        Ok(())
     }
 
     /// 清理空闲连接

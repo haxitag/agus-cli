@@ -1,6 +1,7 @@
 pub mod alerting;
 pub mod container_health;
 pub mod container_logs;
+pub mod host_system_panel;
 pub mod junk_cleaner;
 pub mod nginx;
 pub mod ops_metrics;
@@ -14,8 +15,12 @@ pub use alerting::{
 };
 pub use container_health::{ContainerHealth, ContainerHealthCheckResult, ContainerStatus};
 pub use container_logs::{
-    ContainerLogEntry, ContainerLogError, ContainerLogMonitor, LogLevel, LogStream,
-    SshContainerLogMonitor,
+    ContainerLogEntry, ContainerLogError, ContainerLogFollowRegistry, ContainerLogMonitor,
+    LogLevel, LogStream, SshContainerLogMonitor,
+};
+pub use host_system_panel::{
+    collect_host_system_panel, HostCpuDetail, HostCpuUsageBreakdown, HostFilesystem, HostMemBlock,
+    HostNetIface, HostSystemPanel,
 };
 pub use junk_cleaner::{
     clean_junk_files, get_disk_usage_report, scan_junk_files, DiskUsageReport, DockerSpaceInfo,
@@ -208,11 +213,11 @@ pub fn scan_host_basic<C: SshClient>(
     };
 
     // 6. GPU Info
-    // Check nvidia-smi
+    // Check nvidia-smi（强制短超时，避免驱动挂死把整次扫描拖死）
     let gpu_info = client
         .execute(
             target,
-            "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo ''",
+            "(command -v timeout >/dev/null 2>&1 && timeout 5s nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null) || echo ''",
         )
         .ok()
         .and_then(|res| {

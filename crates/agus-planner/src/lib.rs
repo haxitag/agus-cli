@@ -106,38 +106,47 @@ pub fn generate_deployment_plan_with_llm(
             None
         };
 
-        // Assess risk using LLM if available
+        // Assess risk using LLM if available; fail-closed on assessment errors
         let approval_required = if let Some(ref llm) = llm_provider {
             match llm.assess_risk(&service_name, "DeployService") {
                 Ok(assessment) => {
                     assessment.risk_level == "High" || assessment.risk_level == "Critical"
                 }
-                Err(_) => false,
+                Err(_) => true,
             }
         } else {
             false
         };
 
+        // Emit concrete RunSshCommand — DeployService is not executable in compose mode
+        let deploy_cmd = format!("docker compose up -d -- {service_name}");
         steps.push(DeploymentStep {
             id: deploy_id.clone(),
             service_name: service_name.clone(),
-            action: DeploymentAction::DeployService,
+            action: DeploymentAction::RunSshCommand {
+                command: deploy_cmd,
+            },
             depends_on: deploy_depends_on,
             approval_required,
-            memo,
+            memo: memo.or_else(|| Some(format!("部署服务 {service_name}"))),
         });
 
+        let verify_cmd = format!("docker compose ps -- {service_name}");
         steps.push(DeploymentStep {
             id: format!("verify:{service_name}"),
-            service_name,
-            action: DeploymentAction::VerifyService,
+            service_name: service_name.clone(),
+            action: DeploymentAction::RunSshCommand {
+                command: verify_cmd,
+            },
             depends_on: vec![deploy_id],
             approval_required: false,
-            memo: None,
+            memo: Some(format!("验证服务 {service_name}")),
         });
     }
 
-    let plan = DeploymentPlan { steps };
+    let mut plan = DeploymentPlan { steps };
+    plan.materialize_symbolic_compose_actions()
+        .map_err(|message| PlanGenerationError::InvalidPlan { message })?;
     plan.validate()?;
     Ok(plan)
 }

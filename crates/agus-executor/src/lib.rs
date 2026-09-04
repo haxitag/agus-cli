@@ -370,6 +370,31 @@ impl ExecutionSession {
         mode: ExecutionMode,
         log_stream: Option<LogStreamSender>,
     ) -> Result<Self, ExecutionError> {
+        let mut plan = plan;
+        plan.materialize_symbolic_compose_actions()
+            .map_err(|message| ExecutionError::InvalidPlan { message })?;
+        if matches!(mode, ExecutionMode::Compose { .. }) && plan.has_symbolic_compose_actions() {
+            return Err(ExecutionError::InvalidPlan {
+                message: "plan still contains DeployService/VerifyService after materialization"
+                    .to_string(),
+            });
+        }
+        if let ExecutionMode::Compose { .. } = &mode {
+            for step in &plan.steps {
+                match &step.action {
+                    DeploymentAction::RunSshCommand { .. }
+                    | DeploymentAction::ComposeUp { .. }
+                    | DeploymentAction::ComposeDown { .. } => {}
+                    other => {
+                        return Err(ExecutionError::InvalidPlan {
+                            message: format!(
+                                "action {other:?} is not supported in compose mode (refusing to start)"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         plan.validate()?;
         let mut steps_by_id = HashMap::new();
         for step in plan.steps {
@@ -644,6 +669,7 @@ impl ExecutionSession {
             if matches!(
                 status,
                 ExecutionStatus::Succeeded
+                    | ExecutionStatus::Simulated
                     | ExecutionStatus::Failed
                     | ExecutionStatus::Skipped
                     | ExecutionStatus::RolledBack
@@ -916,7 +942,7 @@ impl ExecutionSession {
         for dependency in &step.depends_on {
             let status = self.status_for(dependency)?;
             match status {
-                ExecutionStatus::Succeeded => {}
+                ExecutionStatus::Succeeded | ExecutionStatus::Simulated => {}
                 ExecutionStatus::Failed
                 | ExecutionStatus::Skipped
                 | ExecutionStatus::RolledBack => return Ok(true),
@@ -954,10 +980,35 @@ impl ExecutionSession {
                         logs: Vec::new(),
                         error: Some("simulated failure".to_string()),
                     }
-                } else {
+                } else if matches!(
+                    step.action,
+                    DeploymentAction::DeployService | DeploymentAction::VerifyService
+                ) {
+                    // Should have been materialized in session start; never green-light symbols.
                     StepOutcome {
-                        status: ExecutionStatus::Succeeded,
+                        status: ExecutionStatus::Failed,
                         logs: Vec::new(),
+                        error: Some(format!(
+                            "dry-run refused symbolic action {:?}; materialize to RunSshCommand first",
+                            step.action
+                        )),
+                    }
+                } else {
+                    let preview = match &step.action {
+                        DeploymentAction::RunSshCommand { command } => {
+                            format!("dry-run (no remote): would run `{command}`")
+                        }
+                        DeploymentAction::ComposeUp { project_dir } => {
+                            format!("dry-run (no remote): would compose up in `{project_dir}`")
+                        }
+                        DeploymentAction::ComposeDown { project_dir } => {
+                            format!("dry-run (no remote): would compose down in `{project_dir}`")
+                        }
+                        other => format!("dry-run (no remote): simulated {other:?}"),
+                    };
+                    StepOutcome {
+                        status: ExecutionStatus::Simulated,
+                        logs: vec![preview],
                         error: None,
                     }
                 }
@@ -2244,7 +2295,7 @@ mod tests {
         assert!(matches!(status_for("deploy:api"), ExecutionStatus::Skipped));
         assert!(matches!(
             status_for("deploy:cache"),
-            ExecutionStatus::Succeeded
+            ExecutionStatus::Simulated
         ));
     }
 
@@ -2259,8 +2310,19 @@ mod tests {
         let records = session.run().expect("execute plan");
         let record = records.first().expect("record");
 
-        assert!(matches!(record.status, ExecutionStatus::Succeeded));
-        assert_eq!(record.logs, vec!["Executing step deploy:api".to_string()]);
+        assert!(matches!(record.status, ExecutionStatus::Simulated));
+        assert!(
+            record
+                .logs
+                .iter()
+                .any(|line| line.contains("Executing step deploy:api"))
+        );
+        assert!(
+            record
+                .logs
+                .iter()
+                .any(|line| line.contains("dry-run (no remote): would run"))
+        );
         assert!(record.error.is_none());
     }
 
@@ -2286,10 +2348,10 @@ mod tests {
         let records = session.approve_step("deploy:db").expect("approve step");
 
         assert!(records.iter().any(|record| {
-            record.step_id == "deploy:db" && matches!(record.status, ExecutionStatus::Succeeded)
+            record.step_id == "deploy:db" && matches!(record.status, ExecutionStatus::Simulated)
         }));
         assert!(records.iter().any(|record| {
-            record.step_id == "deploy:api" && matches!(record.status, ExecutionStatus::Succeeded)
+            record.step_id == "deploy:api" && matches!(record.status, ExecutionStatus::Simulated)
         }));
     }
 
@@ -3588,6 +3650,7 @@ impl LLMDrivenExecutionSession {
     ) -> Result<ExecutionState, ExecutionError> {
         let status = match last.status {
             ExecutionStatus::Succeeded => "succeeded",
+            ExecutionStatus::Simulated => "simulated",
             ExecutionStatus::Failed => "failed",
             ExecutionStatus::WaitingApproval => "waiting_approval",
             ExecutionStatus::Skipped => "skipped",
@@ -3602,7 +3665,10 @@ impl LLMDrivenExecutionSession {
             .filter(|r| {
                 matches!(
                     r.status,
-                    ExecutionStatus::Succeeded | ExecutionStatus::RolledBack | ExecutionStatus::Skipped
+                    ExecutionStatus::Succeeded
+                        | ExecutionStatus::Simulated
+                        | ExecutionStatus::RolledBack
+                        | ExecutionStatus::Skipped
                 )
             })
             .map(|r| CompletedStepInfo {

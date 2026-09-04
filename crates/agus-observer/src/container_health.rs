@@ -135,8 +135,11 @@ pub fn check_container_health(
                 None
             };
 
-            // Get container stats (CPU and memory)
-            let stats_cmd = format!("docker stats --no-stream --format '{{{{.CPUPerc}}}}\\t{{{{.MemUsage}}}}\\t{{{{.MemPerc}}}}' {}", container_id_or_name);
+            // Get container stats（远端 timeout，避免 docker daemon 挂死）
+            let stats_cmd = format!(
+                "(command -v timeout >/dev/null 2>&1 && timeout 8s docker stats --no-stream --format '{{{{.CPUPerc}}}}\\t{{{{.MemUsage}}}}\\t{{{{.MemPerc}}}}' {}) || docker stats --no-stream --format '{{{{.CPUPerc}}}}\\t{{{{.MemUsage}}}}\\t{{{{.MemPerc}}}}' {}",
+                container_id_or_name, container_id_or_name
+            );
             let stats_result = match client.execute(target, &stats_cmd) {
                 Ok(res) => Some(res),
                 Err(_) => {
@@ -353,7 +356,7 @@ pub fn check_all_containers_health(
         }
     } else {
         // Get list of all running containers from server
-        let ps_cmd = "docker ps --format '{{.ID}}\t{{.Names}}'";
+        let ps_cmd = "(command -v timeout >/dev/null 2>&1 && timeout 8s docker ps --format '{{.ID}}\\t{{.Names}}') || docker ps --format '{{.ID}}\\t{{.Names}}'";
         let ps_result = match client.execute(target, ps_cmd) {
             Ok(res) => res,
             Err(_) => {

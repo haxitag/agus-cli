@@ -2706,6 +2706,14 @@ impl LlmProvider for OpenAICompatibleProvider {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         tokio::spawn(async move {
+            let is_local = api_url.contains("127.0.0.1") || api_url.contains("localhost");
+            if api_key.trim().is_empty() && !is_local {
+                let _ = tx.send(Err(LlmError::ConfigError {
+                    message: "LLM API key is empty; refusing to stream without credentials".to_string(),
+                }));
+                return;
+            }
+
             let messages_arr = if let Some(ref msgs) = messages {
                 let mut arr: Vec<serde_json::Value> = Vec::new();
                 if !system_prompt.is_empty() {
@@ -3422,12 +3430,20 @@ pub fn build_deployment_plan_prompt(context: &DeploymentPlanContext) -> Result<S
         context.remote_state.compose_version,
         context.remote_state.running_containers_count,
         context.remote_state.available_images_count,
-        format!("{:.1}", context.remote_state.cpu_usage),
-        format!("{:.1}", context.remote_state.memory_usage),
-        format!("{:.1}", context.remote_state.disk_usage),
+        format_usage_or_unknown(context.remote_state.cpu_usage),
+        format_usage_or_unknown(context.remote_state.memory_usage),
+        format_usage_or_unknown(context.remote_state.disk_usage),
     );
 
     Ok(prompt)
+}
+
+fn format_usage_or_unknown(value: f64) -> String {
+    if value < 0.0 {
+        "unknown (metrics collection failed)".to_string()
+    } else {
+        format!("{:.1}", value)
+    }
 }
 
 /// 构建环境扫描报告分析的 Prompt

@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agus_cli_core::{
-    admin, audit, config, context, exec, executions, hosts, plan, projects, risk,
+    admin, audit, config, context, exec, executions, exit_codes, hosts, plan, projects, risk,
     terminal_history, CliError,
 };
 use agus_core_domain::{
@@ -511,7 +511,7 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("error: {err}");
-            std::process::exit(exit_code_from_error(&err));
+            std::process::exit(exit_codes::exit_code_from_error(&err));
         }
     }
 }
@@ -547,26 +547,7 @@ fn handle_command(command: AgusCommand, format: OutputFormat) -> Result<i32, Cli
     }
 }
 
-fn exit_code_from_error(err: &CliError) -> i32 {
-    // 约定：可脚本化的稳定退出码
-    match err {
-        CliError::InvalidInput(message) => {
-            if message.to_lowercase().contains("not found") {
-                4
-            } else {
-                2
-            }
-        }
-        CliError::AdminMissing | CliError::AuthFailed => 3,
-        CliError::Config(_) => 2,
-        CliError::Ssh(ssh) => match ssh {
-            agus_ssh::SshError::Timeout { .. } => 124,
-            agus_ssh::SshError::Connection { .. } => 10,
-            agus_ssh::SshError::Command { .. } => 11,
-        },
-        CliError::Storage(_) | CliError::Io(_) | CliError::Json(_) => 1,
-    }
-}
+// exit codes: agus_cli_core::exit_codes（GUI/CLI/脚本唯一真相源）
 
 fn handle_exec(cmd: ExecCommand) -> Result<i32, CliError> {
     if cmd.cmd.is_empty() {
@@ -1066,6 +1047,7 @@ struct ExecutionMeta {
     host_address: String,
     environment: Environment,
     plan: DeploymentPlan,
+    mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1101,7 +1083,7 @@ fn handle_deploy_run(cmd: DeployRunCommand, format: OutputFormat) -> Result<(), 
     let (session, stream_handle) =
         create_execution_session(mode, plan.clone(), host_ctx.clone(), cmd.stream)?;
 
-    let meta = build_execution_meta(&execution_id, &host_meta, &plan);
+    let meta = build_execution_meta(&execution_id, &host_meta, &plan, mode.label());
     let checkpoint_path = executions::checkpoint_path(&execution_id)?;
     let mut session = attach_record_writer(session.with_checkpoint(checkpoint_path.clone()), &meta);
 
@@ -1181,7 +1163,7 @@ fn handle_deploy_resume(cmd: DeployResumeCommand) -> Result<(), CliError> {
         .plan_path
         .ok_or_else(|| CliError::InvalidInput("plan path missing for execution".to_string()))?;
     let plan = plan::load_plan(&plan_path)?;
-    let meta = build_execution_meta(&cmd.execution_id, &host, &plan);
+    let meta = build_execution_meta(&cmd.execution_id, &host, &plan, mode.label());
 
     let (session, stream_handle) = resume_execution_session(
         mode,
@@ -1685,6 +1667,7 @@ fn build_execution_meta(
     execution_id: &str,
     host: &Option<Host>,
     plan: &DeploymentPlan,
+    mode: &str,
 ) -> ExecutionMeta {
     let (host_id, host_address, environment) = match host {
         Some(host) => (host.id.clone(), host.address.clone(), host.environment),
@@ -1696,6 +1679,7 @@ fn build_execution_meta(
         host_address,
         environment,
         plan: plan.clone(),
+        mode: mode.to_string(),
     }
 }
 
@@ -1754,6 +1738,7 @@ fn append_ops_event(
         trace_id: Some(meta.execution_id.clone()),
         project_id: None,
         scan_id: None,
+        mode: Some(meta.mode.clone()),
     };
 
     let storage = create_storage_backend();

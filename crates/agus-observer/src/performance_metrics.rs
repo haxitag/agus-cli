@@ -109,15 +109,25 @@ fn collect_cpu_metrics<C: SshClient>(
     let cpu_cmd = "top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\\([0-9.]*\\)%* id.*/\\1/' | awk '{print 100 - $1}'";
     let cpu_result = client.execute(target, cpu_cmd).ok();
     let usage_percent = if let Some(result) = cpu_result {
-        result.stdout.trim().parse::<f64>().unwrap_or(0.0)
-    } else {
-        // 备用方法：使用vmstat
-        let vmstat_cmd = "vmstat 1 2 | tail -1 | awk '{print 100 - $15}'";
-        if let Ok(vmstat_result) = client.execute(target, vmstat_cmd) {
-            vmstat_result.stdout.trim().parse::<f64>().unwrap_or(0.0)
-        } else {
-            0.0
+        match result.stdout.trim().parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                let vmstat_cmd = "vmstat 1 2 | tail -1 | awk '{print 100 - $15}'";
+                let vmstat_result = client.execute(target, vmstat_cmd)?;
+                vmstat_result.stdout.trim().parse::<f64>().map_err(|_| SshError::Command {
+                    exit_code: -1,
+                    stderr: "failed to parse CPU usage from top/vmstat".to_string(),
+                })?
+            }
         }
+    } else {
+        let vmstat_cmd = "vmstat 1 2 | tail -1 | awk '{print 100 - $15}'";
+        let vmstat_result = client.execute(target, vmstat_cmd)?;
+        vmstat_result.stdout.trim().parse::<f64>().map_err(|_| SshError::Command {
+            exit_code: -1,
+            stderr: "failed to collect CPU usage (top unavailable, vmstat parse failed)"
+                .to_string(),
+        })?
     };
 
     // 获取负载平均值
@@ -126,16 +136,24 @@ fn collect_cpu_metrics<C: SshClient>(
     let load_parts: Vec<&str> = loadavg_result.stdout.trim().split_whitespace().collect();
     let load_average = if load_parts.len() >= 3 {
         LoadAverage {
-            one_min: load_parts[0].parse().unwrap_or(0.0),
-            five_min: load_parts[1].parse().unwrap_or(0.0),
-            fifteen_min: load_parts[2].parse().unwrap_or(0.0),
+            one_min: load_parts[0].parse().map_err(|_| SshError::Command {
+                exit_code: -1,
+                stderr: "failed to parse loadavg 1min".to_string(),
+            })?,
+            five_min: load_parts[1].parse().map_err(|_| SshError::Command {
+                exit_code: -1,
+                stderr: "failed to parse loadavg 5min".to_string(),
+            })?,
+            fifteen_min: load_parts[2].parse().map_err(|_| SshError::Command {
+                exit_code: -1,
+                stderr: "failed to parse loadavg 15min".to_string(),
+            })?,
         }
     } else {
-        LoadAverage {
-            one_min: 0.0,
-            five_min: 0.0,
-            fifteen_min: 0.0,
-        }
+        return Err(SshError::Command {
+            exit_code: -1,
+            stderr: "failed to collect load average from /proc/loadavg".to_string(),
+        });
     };
 
     Ok(CpuMetrics {
@@ -155,17 +173,23 @@ fn collect_memory_metrics<C: SshClient>(
     let parts: Vec<&str> = free_result.stdout.trim().split_whitespace().collect();
 
     if parts.len() >= 5 {
-        let total_mb = parts[0].parse().unwrap_or(0.0);
-        let used_mb = parts[1].parse().unwrap_or(0.0);
-        let free_mb = parts[2].parse().unwrap_or(0.0);
-        let buffers_mb = parts[3].parse().unwrap_or(0.0);
-        let cached_mb = parts[4].parse().unwrap_or(0.0);
-
-        let usage_percent = if total_mb > 0.0 {
-            (used_mb / total_mb) * 100.0
-        } else {
-            0.0
+        let parse_f = |idx: usize, label: &str| -> Result<f64, SshError> {
+            parts[idx].parse().map_err(|_| SshError::Command {
+                exit_code: -1,
+                stderr: format!("failed to parse memory {label} from free"),
+            })
         };
+        let total_mb = parse_f(0, "total")?;
+        let used_mb = parse_f(1, "used")?;
+        let free_mb = parse_f(2, "free")?;
+        let buffers_mb = parse_f(3, "buffers")?;
+        let cached_mb = parse_f(4, "cached")?;
+        if total_mb <= 0.0 {
+            return Err(SshError::Command {
+                exit_code: -1,
+                stderr: "memory total_mb is 0; refusing fake idle metrics".to_string(),
+            });
+        }
 
         Ok(MemoryMetrics {
             total_mb,
@@ -173,7 +197,7 @@ fn collect_memory_metrics<C: SshClient>(
             free_mb,
             cached_mb,
             buffers_mb,
-            usage_percent,
+            usage_percent: (used_mb / total_mb) * 100.0,
         })
     } else {
         // 备用方法：使用更简单的free命令
@@ -189,29 +213,44 @@ fn parse_memory_from_free(output: &str) -> Result<MemoryMetrics, SshError> {
     let mut free_mb = 0.0;
     let mut buffers_mb = 0.0;
     let mut cached_mb = 0.0;
+    let mut found_mem = false;
 
     for line in output.lines() {
         if line.starts_with("Mem:") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
-                total_mb = parts[1].parse().unwrap_or(0.0);
-                used_mb = parts[2].parse().unwrap_or(0.0);
-                free_mb = parts[3].parse().unwrap_or(0.0);
+                let parse_f = |idx: usize, label: &str| -> Result<f64, SshError> {
+                    parts[idx].parse().map_err(|_| SshError::Command {
+                        exit_code: -1,
+                        stderr: format!("failed to parse memory {label} from free Mem: line"),
+                    })
+                };
+                total_mb = parse_f(1, "total")?;
+                used_mb = parse_f(2, "used")?;
+                free_mb = parse_f(3, "free")?;
                 if parts.len() >= 6 {
-                    buffers_mb = parts[5].parse().unwrap_or(0.0);
+                    buffers_mb = parse_f(5, "buffers")?;
                 }
                 if parts.len() >= 7 {
-                    cached_mb = parts[6].parse().unwrap_or(0.0);
+                    cached_mb = parse_f(6, "cached")?;
                 }
+                found_mem = true;
             }
         }
     }
 
-    let usage_percent = if total_mb > 0.0 {
-        (used_mb / total_mb) * 100.0
-    } else {
-        0.0
-    };
+    if !found_mem {
+        return Err(SshError::Command {
+            exit_code: -1,
+            stderr: "free output missing Mem: line; refusing fake zero memory metrics".to_string(),
+        });
+    }
+    if total_mb <= 0.0 {
+        return Err(SshError::Command {
+            exit_code: -1,
+            stderr: "memory total_mb is 0; refusing fake idle metrics".to_string(),
+        });
+    }
 
     Ok(MemoryMetrics {
         total_mb,
@@ -219,7 +258,7 @@ fn parse_memory_from_free(output: &str) -> Result<MemoryMetrics, SshError> {
         free_mb,
         cached_mb,
         buffers_mb,
-        usage_percent,
+        usage_percent: (used_mb / total_mb) * 100.0,
     })
 }
 
@@ -227,37 +266,49 @@ fn collect_disk_metrics<C: SshClient>(
     client: &C,
     target: &SshTarget,
 ) -> Result<Vec<DiskMetrics>, SshError> {
-    // 使用df命令获取磁盘使用情况
+    // df -hT：含真实文件系统类型，禁止写死 ext4
     let df_cmd =
-        "df -h | grep -vE '^Filesystem|tmpfs|cdrom' | awk '{print $1, $2, $3, $4, $5, $6}'";
+        "df -hT | grep -vE '^Filesystem|tmpfs|cdrom|devtmpfs' | awk '{print $1, $2, $3, $4, $5, $6, $7}'";
     let df_result = client.execute(target, df_cmd)?;
 
     let mut disks = Vec::new();
+    let mut parse_errors = 0usize;
     for line in df_result.stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 6 {
+        if parts.len() >= 7 {
             let device = parts[0].to_string();
-            let total_str = parts[1];
-            let used_str = parts[2];
-            let available_str = parts[3];
-            let usage_percent_str = parts[4].trim_end_matches('%');
-            let mount_point = parts[5].to_string();
+            let filesystem = parts[1].to_string();
+            let total_str = parts[2];
+            let used_str = parts[3];
+            let available_str = parts[4];
+            let usage_percent_str = parts[5].trim_end_matches('%');
+            let mount_point = parts[6].to_string();
 
-            let total_gb = parse_size_to_gb(total_str);
-            let used_gb = parse_size_to_gb(used_str);
-            let available_gb = parse_size_to_gb(available_str);
-            let usage_percent = usage_percent_str.parse().unwrap_or(0.0);
+            let usage_percent = match usage_percent_str.parse::<f64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    parse_errors += 1;
+                    continue;
+                }
+            };
 
             disks.push(DiskMetrics {
                 device,
                 mount_point,
-                total_gb,
-                used_gb,
-                available_gb,
+                total_gb: parse_size_to_gb(total_str),
+                used_gb: parse_size_to_gb(used_str),
+                available_gb: parse_size_to_gb(available_str),
                 usage_percent,
-                filesystem: "ext4".to_string(), // 默认值，实际可以通过其他命令获取
+                filesystem,
             });
         }
+    }
+
+    if disks.is_empty() && !df_result.stdout.trim().is_empty() && parse_errors > 0 {
+        return Err(SshError::Command {
+            exit_code: -1,
+            stderr: "failed to parse any disk usage percent from df -hT".to_string(),
+        });
     }
 
     Ok(disks)

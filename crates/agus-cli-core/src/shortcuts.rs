@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,6 +43,14 @@ fn default_auto_run() -> bool {
 
 fn shortcuts_path() -> Result<PathBuf, CliError> {
     Ok(config::agus_home()?.join("cli_shortcuts.json"))
+}
+
+/// 内置默认集的“补齐版本”。每次扩充内置默认指令时 +1，
+/// 用于对已存在 cli_shortcuts.json 的老用户做一次增量合并（不覆盖用户编辑/删除）。
+const SHORTCUTS_SEED_VERSION: u32 = 2;
+
+fn seed_version_path() -> Result<PathBuf, CliError> {
+    Ok(config::agus_home()?.join("cli_shortcuts_seed_version"))
 }
 
 pub fn load_shortcuts() -> Result<Vec<CliShortcut>, CliError> {
@@ -132,13 +141,70 @@ pub fn default_shortcuts() -> Vec<CliShortcut> {
             auto_run: true,
             tags: vec!["logs".to_string()],
         },
+        CliShortcut {
+            id: "docker-stats".to_string(),
+            name: "Docker 实时统计".to_string(),
+            command: "docker stats".to_string(),
+            shortcut_type: ShortcutType::Shell,
+            host_scope: vec![],
+            auto_run: true,
+            tags: vec!["docker".to_string()],
+        },
+        CliShortcut {
+            id: "journal-xe".to_string(),
+            name: "故障日志上下文".to_string(),
+            command: "journalctl -xe".to_string(),
+            shortcut_type: ShortcutType::Shell,
+            host_scope: vec![],
+            auto_run: true,
+            tags: vec!["logs".to_string(), "systemd".to_string()],
+        },
     ]
 }
 
 pub fn ensure_default_shortcuts() -> Result<(), CliError> {
     let path = shortcuts_path()?;
-    if path.exists() {
+    let version_path = seed_version_path()?;
+    // 读取已补齐的种子版本；无标记视为旧版本（v1 初始内置集）
+    let seeded_version: u32 = fs::read_to_string(&version_path)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+
+    // 已按最新版本补齐过：仅当指令文件被删除时重建默认集
+    if seeded_version >= SHORTCUTS_SEED_VERSION {
+        if !path.exists() {
+            save_shortcuts(&default_shortcuts())?;
+        }
         return Ok(());
     }
-    save_shortcuts(&default_shortcuts())
+
+    // 版本落后：合并缺失的内置默认指令（按 id 去重，保留用户的编辑/自定义项）
+    let mut shortcuts = if path.exists() {
+        fs::read_to_string(&path)
+            .ok()
+            .filter(|data| !data.trim().is_empty())
+            .and_then(|data| serde_json::from_str::<Vec<CliShortcut>>(&data).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let existing_ids: HashSet<String> = shortcuts.iter().map(|s| s.id.clone()).collect();
+    let mut changed = false;
+    for default in default_shortcuts() {
+        if !existing_ids.contains(&default.id) {
+            shortcuts.push(default);
+            changed = true;
+        }
+    }
+    if changed {
+        save_shortcuts(&shortcuts)?;
+    }
+
+    // 推进种子版本（无论是否合并成功，避免每次启动重复尝试；文件被清空/删除时按 load 逻辑回退默认集）
+    if let Some(parent) = version_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&version_path, SHORTCUTS_SEED_VERSION.to_string())?;
+    Ok(())
 }

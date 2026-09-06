@@ -221,12 +221,13 @@ impl ContainerLogFollowRegistry {
         };
         stop_flag.store(true, Ordering::SeqCst);
 
-        // Best-effort: terminate remote `docker logs -f` so the SSH stream ends.
+        // Best-effort: terminate remote `docker logs -f` so the SSH stream ends。
+        // pkill -f 按正则对整条命令行做匹配：必须对容器名做正则转义并以 `$`
+        // 锚定命令结尾（argv 末尾即 `-- <container>`），否则停止容器 `api` 的
+        // 日志跟随会误杀同主机的 `api2` / `api-backend`，也会误伤其它 docker logs 进程。
         let client = agus_ssh::ProcessSshClient::new();
-        let container_arg = escape_shell_arg(container_id);
-        let kill_cmd = format!(
-            "pkill -f \"docker logs .*-- {container_arg}\" 2>/dev/null || pkill -f \"docker logs .*{container_id}\" 2>/dev/null || true"
-        );
+        let id_re = regex_escape(container_id);
+        let kill_cmd = format!("pkill -f 'docker logs .*-- {id_re}$' 2>/dev/null || true");
         let _ = client.execute(&kill_target, &kill_cmd);
         Ok(())
     }
@@ -397,6 +398,18 @@ impl ContainerLogMonitor for SshContainerLogMonitor {
 
 fn escape_shell_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// 将字符串转义为 pkill -f 的 ERE 字面量（pkill 按整条命令行做正则匹配）。
+fn regex_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ".[]{}()*+-?^$|\\".contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn parse_docker_log_line(line: &str, container_id: &str) -> Option<ContainerLogEntry> {

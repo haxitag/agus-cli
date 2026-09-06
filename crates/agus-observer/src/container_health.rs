@@ -69,9 +69,12 @@ pub fn check_container_health(
     // 1. 首先尝试获取完整信息(包含 Health 状态)
     // 2. 如果失败(可能是容器没有 Health 配置导致的模板错误),则降级尝试不获取 Health 状态
 
+    // 容器名/ID 可能来自远程 `docker ps` 或用户配置，统一做单引号 shell 转义，
+    // 防止含空格/`;`/`$()`/反引号等元字符的名称在远端 shell 中被解析为额外命令。
+    let container_arg = shell_quote(container_id_or_name);
     let full_inspect_cmd = format!(
         "docker inspect --format '{{{{.Id}}}}|||{{{{.Name}}}}|||{{{{.State.Status}}}}|||{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}<no-health>{{{{end}}}}|||{{{{.RestartCount}}}}|||{{{{.State.StartedAt}}}}' {}",
-        container_id_or_name
+        container_arg
     );
 
     let inspect_result = match client.execute(target, &full_inspect_cmd) {
@@ -81,7 +84,7 @@ pub fn check_container_health(
             // 这通常解决 "map has no entry for key Health" 的问题
             let simple_inspect_cmd = format!(
                 "docker inspect --format '{{{{.Id}}}}|||{{{{.Name}}}}|||{{{{.State.Status}}}}|||<no-health>|||{{{{.RestartCount}}}}|||{{{{.State.StartedAt}}}}' {}",
-                container_id_or_name
+                container_arg
             );
 
             match client.execute(target, &simple_inspect_cmd) {
@@ -138,7 +141,7 @@ pub fn check_container_health(
             // Get container stats（远端 timeout，避免 docker daemon 挂死）
             let stats_cmd = format!(
                 "(command -v timeout >/dev/null 2>&1 && timeout 8s docker stats --no-stream --format '{{{{.CPUPerc}}}}\\t{{{{.MemUsage}}}}\\t{{{{.MemPerc}}}}' {}) || docker stats --no-stream --format '{{{{.CPUPerc}}}}\\t{{{{.MemUsage}}}}\\t{{{{.MemPerc}}}}' {}",
-                container_id_or_name, container_id_or_name
+                container_arg, container_arg
             );
             let stats_result = match client.execute(target, &stats_cmd) {
                 Ok(res) => Some(res),
@@ -339,6 +342,11 @@ fn check_health_issues(health: &ContainerHealth, issues: &mut Vec<String>) -> bo
     }
 
     is_healthy
+}
+
+/// POSIX 单引号转义：用于将容器名/ID 作为单个安全参数拼入远端 shell 命令。
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub fn check_all_containers_health(

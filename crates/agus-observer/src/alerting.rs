@@ -256,16 +256,27 @@ impl AlertManager for InMemoryAlertManager {
 
     fn evaluate(&mut self, metrics: &AlertMetrics) -> Result<Vec<Alert>, AlertError> {
         let mut new_alerts = Vec::new();
+        // 本次评估中恢复（不再触发）的规则，评估后从 active 中清除，
+        // 使同一 rule+resource 的"故障→恢复→再次故障"能够再次产生告警，
+        // 而不是只告警一次后被永久吞掉。
+        let mut recovered_keys: Vec<String> = Vec::new();
 
         for rule in self.rules.values() {
+            let alert_key = format!("{}_{:?}", rule.id, metrics.resource_id);
             if let Some(alert) = self.evaluate_rule(rule, metrics) {
-                // Check if alert already exists
-                let alert_key = format!("{}_{:?}", rule.id, metrics.resource_id);
+                // 已处于 active 的同类告警不重复产生，保持去重
                 if !self.active_alerts.contains_key(&alert_key) {
                     self.active_alerts.insert(alert_key, alert.clone());
                     new_alerts.push(alert);
                 }
+            } else if self.active_alerts.contains_key(&alert_key) {
+                // 阈值回落/规则禁用 => 自动清除 active 状态（自恢复）
+                recovered_keys.push(alert_key);
             }
+        }
+
+        for key in recovered_keys {
+            self.active_alerts.remove(&key);
         }
 
         Ok(new_alerts)
@@ -304,5 +315,71 @@ impl AlertManager for InMemoryAlertManager {
 impl Default for InMemoryAlertManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_rule(threshold: f64) -> AlertRule {
+        AlertRule {
+            id: "rule-cpu".to_string(),
+            name: "CPU 高负载".to_string(),
+            metric_type: MetricType::CpuUsage,
+            threshold,
+            comparison: Comparison::GreaterThan,
+            severity: AlertSeverity::Critical,
+            enabled: true,
+        }
+    }
+
+    fn metrics(cpu: f64) -> AlertMetrics {
+        AlertMetrics {
+            cpu_usage_percent: Some(cpu),
+            memory_usage_percent: None,
+            disk_usage_percent: None,
+            network_error_rate: None,
+            container_restart_count: None,
+            container_uptime_seconds: None,
+            custom_metrics: HashMap::new(),
+            resource_id: Some("host1".to_string()),
+            resource_type: Some("host".to_string()),
+        }
+    }
+
+    #[test]
+    fn repeated_breach_after_recovery_fires_again() {
+        let mut m = InMemoryAlertManager::new();
+        m.add_rule(cpu_rule(90.0)).unwrap();
+
+        // 1) 首次超限 -> 1 条新告警
+        assert_eq!(m.evaluate(&metrics(95.0)).unwrap().len(), 1);
+        assert_eq!(m.get_active_alerts().len(), 1);
+
+        // 2) 持续超限 -> 去重，不重复告警
+        assert_eq!(m.evaluate(&metrics(96.0)).unwrap().len(), 0);
+
+        // 3) 回落恢复 -> 不产生新告警，且 active 被清除
+        assert_eq!(m.evaluate(&metrics(50.0)).unwrap().len(), 0);
+        assert_eq!(m.get_active_alerts().len(), 0);
+
+        // 4) 恢复后再次超限 -> 必须能再次告警（修复前此步永远丢失）
+        assert_eq!(m.evaluate(&metrics(97.0)).unwrap().len(), 1);
+        assert_eq!(m.get_active_alerts().len(), 1);
+    }
+
+    #[test]
+    fn disabled_rule_is_auto_cleared() {
+        let mut m = InMemoryAlertManager::new();
+        let mut rule = cpu_rule(90.0);
+        m.add_rule(rule.clone()).unwrap();
+        assert_eq!(m.evaluate(&metrics(95.0)).unwrap().len(), 1);
+
+        // 禁用规则后，下一轮评估将其 active 告警清除
+        rule.enabled = false;
+        m.add_rule(rule).unwrap();
+        assert_eq!(m.evaluate(&metrics(95.0)).unwrap().len(), 0);
+        assert_eq!(m.get_active_alerts().len(), 0);
     }
 }

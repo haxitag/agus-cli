@@ -42,7 +42,7 @@ agus --format json host list
 
 ### HaxiTAG Base 安装
 
-HaxiTAG Base 是轻量、性能优先的 macOS 多工作区 / 多标签 / 多面板终端，面向开发者并行多任务场景，与 Agus 一起在同一 Releases 页面独立发版：下载 `HaxiTAG Base_<version>_aarch64.dmg`（当前 v0.1.0），双击挂载后将 `HaxiTAG Base.app` 拖入「应用程序」。安装包已用 Developer ID 签名并通过 Apple 公证，首次打开无需额外放行。
+HaxiTAG Base 是轻量、性能优先的 macOS 多工作区 / 多标签 / 多面板终端，面向开发者并行多任务场景，与 Agus 一起在同一 Releases 页面独立发版：在 Releases 页面下载 HaxiTAG Base 的 `.dmg` 安装包（当前 v0.1.0，Apple Silicon），双击挂载后将 `HaxiTAG Base.app` 拖入「应用程序」。安装包已用 Developer ID 签名并通过 Apple 公证，首次打开无需额外放行。
 
 ## HaxiTAG Base 使用说明
 

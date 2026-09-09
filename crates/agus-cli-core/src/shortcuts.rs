@@ -21,6 +21,24 @@ impl Default for ShortcutType {
     }
 }
 
+/// 快捷指令所属的面板/用途。
+/// - `Common`：终端命令面板 + 工具箱「常用命令」（默认，兼容历史数据）
+/// - `QuickMonitor`：工具箱「快捷监控」手工新增项
+/// - `SimpleAnalyze`：「简单分析」对话框的手工自定义指令
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ShortcutPanel {
+    Common,
+    QuickMonitor,
+    SimpleAnalyze,
+}
+
+impl Default for ShortcutPanel {
+    fn default() -> Self {
+        Self::Common
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliShortcut {
@@ -35,6 +53,9 @@ pub struct CliShortcut {
     pub auto_run: bool,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 所在面板：默认 `common`（存量数据靠 serde 默认补齐，不影响读写）
+    #[serde(default)]
+    pub panel: ShortcutPanel,
 }
 
 fn default_auto_run() -> bool {
@@ -113,6 +134,7 @@ pub fn default_shortcuts() -> Vec<CliShortcut> {
             host_scope: vec![],
             auto_run: true,
             tags: vec!["sre".to_string(), "disk".to_string()],
+            panel: ShortcutPanel::Common,
         },
         CliShortcut {
             id: "docker-status".to_string(),
@@ -122,6 +144,7 @@ pub fn default_shortcuts() -> Vec<CliShortcut> {
             host_scope: vec![],
             auto_run: true,
             tags: vec!["docker".to_string()],
+            panel: ShortcutPanel::Common,
         },
         CliShortcut {
             id: "service-failed".to_string(),
@@ -131,6 +154,7 @@ pub fn default_shortcuts() -> Vec<CliShortcut> {
             host_scope: vec![],
             auto_run: true,
             tags: vec!["systemd".to_string()],
+            panel: ShortcutPanel::Common,
         },
         CliShortcut {
             id: "log-errors".to_string(),
@@ -140,6 +164,7 @@ pub fn default_shortcuts() -> Vec<CliShortcut> {
             host_scope: vec![],
             auto_run: true,
             tags: vec!["logs".to_string()],
+            panel: ShortcutPanel::Common,
         },
         CliShortcut {
             id: "docker-stats".to_string(),
@@ -149,6 +174,7 @@ pub fn default_shortcuts() -> Vec<CliShortcut> {
             host_scope: vec![],
             auto_run: true,
             tags: vec!["docker".to_string()],
+            panel: ShortcutPanel::Common,
         },
         CliShortcut {
             id: "journal-xe".to_string(),
@@ -158,6 +184,7 @@ pub fn default_shortcuts() -> Vec<CliShortcut> {
             host_scope: vec![],
             auto_run: true,
             tags: vec!["logs".to_string(), "systemd".to_string()],
+            panel: ShortcutPanel::Common,
         },
     ]
 }

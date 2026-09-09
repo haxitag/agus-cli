@@ -115,6 +115,23 @@ impl std::fmt::Display for SshError {
 
 impl std::error::Error for SshError {}
 
+impl SshError {
+    /// 是否属于 SSH 认证失败（如密码错误 / public key 被拒）。
+    ///
+    /// 认证失败通常源于凭据失效或主机侧风控，重试无意义且会把失败登录
+    /// 次数放大数倍、触发云厂商 fail2ban / 防暴力破解的封禁，因此所有
+    /// 调用方遇到该错误应立即失败返回，而不是退避重试。
+    pub fn is_authentication(&self) -> bool {
+        match self {
+            SshError::Connection { message } => {
+                let lower = message.to_ascii_lowercase();
+                lower.contains("permission denied") || lower.contains("authentication failed")
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,10 +346,12 @@ impl ProcessSshClient {
             match self.try_execute_with_control(target, command, control) {
                 Ok(result) => return Ok(result),
                 Err(err) => {
-                    // 超时多为远端挂死（如 docker info）；重试只会把卡顿放大数倍
+                    // 超时多为远端挂死（如 docker info）；重试只会把卡顿放大数倍；
+                    // 认证失败（凭据无效）重试无意义且会放大云厂商封禁风险
                     let timed_out = matches!(&err, SshError::Timeout { .. });
+                    let auth_failed = err.is_authentication();
                     last_error = Some(err);
-                    if timed_out || attempt + 1 >= self.config.max_retries {
+                    if timed_out || auth_failed || attempt + 1 >= self.config.max_retries {
                         break;
                     }
                     std::thread::sleep(self.config.retry_delay);
@@ -355,8 +374,9 @@ impl ProcessSshClient {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     let timed_out = matches!(&err, SshError::Timeout { .. });
+                    let auth_failed = err.is_authentication();
                     last_error = Some(err);
-                    if timed_out || attempt + 1 >= self.config.max_retries {
+                    if timed_out || auth_failed || attempt + 1 >= self.config.max_retries {
                         break;
                     }
                     std::thread::sleep(self.config.retry_delay);
@@ -1079,8 +1099,9 @@ impl SshClient for ProcessSshClient {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     let timed_out = matches!(&err, SshError::Timeout { .. });
+                    let auth_failed = err.is_authentication();
                     last_error = Some(err);
-                    if timed_out || attempt + 1 >= self.config.max_retries {
+                    if timed_out || auth_failed || attempt + 1 >= self.config.max_retries {
                         break;
                     }
                     std::thread::sleep(self.config.retry_delay);
@@ -1104,8 +1125,9 @@ impl SshClient for ProcessSshClient {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     let timed_out = matches!(&err, SshError::Timeout { .. });
+                    let auth_failed = err.is_authentication();
                     last_error = Some(err);
-                    if timed_out || attempt + 1 >= self.config.max_retries {
+                    if timed_out || auth_failed || attempt + 1 >= self.config.max_retries {
                         break;
                     }
                     std::thread::sleep(self.config.retry_delay);

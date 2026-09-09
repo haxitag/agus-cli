@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct ContainerHealth {
     pub container_id: String,
     pub container_name: String,
+    pub image: Option<String>,
     pub status: ContainerStatus,
     pub health_status: Option<String>, // "healthy", "unhealthy", "starting", "none"
     pub restart_count: u32,
@@ -73,7 +74,7 @@ pub fn check_container_health(
     // 防止含空格/`;`/`$()`/反引号等元字符的名称在远端 shell 中被解析为额外命令。
     let container_arg = shell_quote(container_id_or_name);
     let full_inspect_cmd = format!(
-        "docker inspect --format '{{{{.Id}}}}|||{{{{.Name}}}}|||{{{{.State.Status}}}}|||{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}<no-health>{{{{end}}}}|||{{{{.RestartCount}}}}|||{{{{.State.StartedAt}}}}' {}",
+        "docker inspect --format '{{{{.Id}}}}|||{{{{.Name}}}}|||{{{{.State.Status}}}}|||{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}<no-health>{{{{end}}}}|||{{{{.RestartCount}}}}|||{{{{.State.StartedAt}}}}|||{{{{.Config.Image}}}}' {}",
         container_arg
     );
 
@@ -83,7 +84,7 @@ pub fn check_container_health(
             // 第一次尝试失败,尝试使用不带 Health 字段的简化命令
             // 这通常解决 "map has no entry for key Health" 的问题
             let simple_inspect_cmd = format!(
-                "docker inspect --format '{{{{.Id}}}}|||{{{{.Name}}}}|||{{{{.State.Status}}}}|||<no-health>|||{{{{.RestartCount}}}}|||{{{{.State.StartedAt}}}}' {}",
+                "docker inspect --format '{{{{.Id}}}}|||{{{{.Name}}}}|||{{{{.State.Status}}}}|||<no-health>|||{{{{.RestartCount}}}}|||{{{{.State.StartedAt}}}}|||{{{{.Config.Image}}}}' {}",
                 container_arg
             );
 
@@ -118,6 +119,10 @@ pub fn check_container_health(
                 };
             let restart_count = parts[4].trim().parse::<u32>().unwrap_or(0);
             let started_at_str = parts[5].trim();
+            let image = parts
+                .get(6)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && *s != "<no value>");
 
             let status = ContainerStatus::from_docker_status(status_str);
 
@@ -160,6 +165,7 @@ pub fn check_container_health(
             let health = ContainerHealth {
                 container_id: container_id.clone(),
                 container_name: container_name.clone(),
+                image,
                 status,
                 health_status,
                 restart_count,

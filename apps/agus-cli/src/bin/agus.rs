@@ -47,6 +47,8 @@ mod cli_style;
 mod cli_format;
 #[path = "../cli_progress.rs"]
 mod cli_progress;
+#[path = "../skill_cmd.rs"]
+mod skill_cmd;
 use cli_format::OutputFormat;
 use cli_format::print_value;
 use cli_progress::{CliSpinner, use_progress, use_progress_unconditional};
@@ -92,6 +94,8 @@ enum AgusCommand {
     Security(SecurityCommand),
     #[command(subcommand)]
     Diagnose(DiagnoseCommand),
+    #[command(subcommand)]
+    Skill(skill_cmd::SkillCommand),
 }
 
 #[derive(Args)]
@@ -544,6 +548,7 @@ fn handle_command(command: AgusCommand, format: OutputFormat) -> Result<i32, Cli
         AgusCommand::Container(cmd) => handle_container(cmd).map(|_| 0),
         AgusCommand::Security(cmd) => handle_security(cmd).map(|_| 0),
         AgusCommand::Diagnose(cmd) => handle_diagnose(cmd).map(|_| 0),
+        AgusCommand::Skill(cmd) => skill_cmd::handle_skill(cmd).map(|_| 0),
     }
 }
 

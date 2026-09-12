@@ -1,0 +1,28 @@
+id: inspect-host
+summary: >
+  Test-Driven Operation for inspection — capture baseline/verify first, then observe,
+  then analyze. Never mutates the host.
+steps:
+  - id: verify-baseline
+    kind: verify
+    title: Capture or define health verification
+    description: >
+      Define what "healthy" means for this host (disk < threshold, critical containers Up).
+      Prefer failing checks when target state is absent; otherwise capture baseline.
+    command_template: "df -h; free -h; uptime"
+    requires_evidence: true
+  - id: observe-metrics
+    kind: observe
+    title: Collect system and container metrics
+    description: SSH/observer collection of metrics, docker ps, recent errors.
+    command_template: "observer.collect_system_metrics + docker ps --format '{{.Names}} {{.Status}}'"
+    requires_evidence: true
+  - id: analyze
+    kind: analyze
+    title: Summarize findings
+    description: Deterministic thresholds + optional LLM commentary. Report only.
+    requires_evidence: false
+pitfalls:
+  - "Treating a single metric spike as root cause without correlating containers/logs."
+  - "Claiming success without attaching evidence digests (NotProven)."
+  - "Running remediation commands during inspect-host — out of scope; use diagnose-alert / propose."

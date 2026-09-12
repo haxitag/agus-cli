@@ -1,0 +1,23 @@
+id = "inspect-host"
+version = "0.1.0"
+description = """
+Collect host health evidence (CPU/mem/disk/containers) and produce an SRE inspection report.
+Use when: scheduled inspection, user asks host health, environment health check, pre-change baseline.
+"""
+maturity = "stable"
+permissions = ["observe", "analyze"]
+risk_class = "low"
+allowed_actions = []
+requires_human_for = []
+outcome = "Read-only host health report with fresh evidence; no state changes."
+
+[triggers]
+kinds = ["inspection", "schedule", "user"]
+phrases = [
+  "host health",
+  "inspect host",
+  "巡检",
+  "主机健康",
+  "environment health",
+  "baseline",
+]

@@ -12,10 +12,15 @@ Releases（含 **Agus CLI**、**Agus GUI** 与 **HaxiTAG Base** 安装包）：h
 
 ```bash
 # 拉取 CLI 包（版本号以 Releases 页面为准）
-tar -xzf agus-cli-0.2.1-macos-aarch64.tar.gz
-cd agus-cli-0.2.1-macos-aarch64
+tar -xzf agus-cli-0.2.8-macos-aarch64.tar.gz
+cd agus-cli-0.2.8-macos-aarch64
 bash install_cli.sh
 ```
+
+安装脚本会：
+- 将 `agus` / `asda` 装到 `~/.local/bin`（可用 `--bin-dir` 覆盖）
+- 将内置 Ops Skills 装到 `~/.agus/share/skills/`
+- 可选写入 shell PATH（默认开启）
 
 CLI 安装成功后，可使用以下命令：
 
@@ -31,6 +36,12 @@ agus host check --id <host-id>
 
 # 执行命令
 agus exec <host-id> "uptime"
+
+# Ops Skills
+agus skill list
+agus skill show diagnose-alert
+agus skill run diagnose-alert --message "disk 93% full" --dry-run
+agus skill reports --limit 20
 
 # JSON 输出
 agus --format json host list
@@ -62,6 +73,29 @@ HaxiTAG Base 是轻量、性能优先的 macOS 多工作区 / 多标签 / 多面
 | 直接切换到第 1–9 个标签页 | `⌃1–9` |
 | 复制 / 粘贴 | `⌘C` / `⌘V` |
 
+## Ops Skills（运维剧本）
+
+Agus 内置 **Controlled Automation** 风格的 Ops Skills：观察证据 → 分析 → 人类审批提案 →（后续由执行器落地）。默认不把任意 shell 执行权交给模型。
+
+| 内置 Skill | 用途 |
+|-----------|------|
+| `inspect-host` | 主机健康巡检摘要 |
+| `diagnose-alert` | 告警线索诊断并生成可审批动作提案 |
+| `authorize-upgrade` | 升级授权门禁（人审） |
+
+扩展方式（无需改核心代码）：
+
+```text
+~/.agus/skills/<skill-id>/
+  AGUS_SKILL.toml
+  playbook.yaml
+  prompts/analyze.md   # 可选
+```
+
+同 id 的用户包会覆盖内置包。也可用 `AGUS_SKILLS_DIR` 指定另一套内置根目录。
+
+报告落盘：`~/.agus/skill_runs/`（或 `$AGUS_HOME/skill_runs/`）。
+
 ## 激活与配额
 
 通过 https://www.haxitag.com/articles/Agus 获取说明，或关注哈希泰格公众号获取激活码（在公众号发送 `agus`）。
@@ -73,5 +107,6 @@ HaxiTAG Base 是轻量、性能优先的 macOS 多工作区 / 多标签 / 多面
 | 帮助 | `agus --help` 或 `agus <command> --help` |
 | 主机管理 | `agus host list/show/check` |
 | 执行命令 | `agus exec <host-id> "命令"` |
+| Ops Skills | `agus skill list/show/run/approve/reject/reports` |
 | 查看日志 | `agus logs <host-id>` |
 | 监控 | `agus monitor <host-id>` |

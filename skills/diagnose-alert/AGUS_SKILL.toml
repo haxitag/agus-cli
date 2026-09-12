@@ -1,0 +1,41 @@
+id = "diagnose-alert"
+version = "0.1.0"
+description = """
+Diagnose an Agus alert or incident: collect logs/metrics, verify the failure, derive root-cause
+hypotheses and remediation proposals. Never executes fixes without human approval.
+Use when: alert fires, CrashLoop, OOM, 5xx spike, disk full, SSH service down, user asks why alert.
+"""
+maturity = "stable"
+permissions = ["observe", "analyze", "propose_execute"]
+risk_class = "high"
+allowed_actions = [
+  "journalctl",
+  "docker logs",
+  "docker inspect",
+  "systemctl status",
+  "nginx -t",
+  "df -h",
+  "free -h",
+  "ss -tlnp",
+]
+requires_human_for = [
+  "prod_state_change",
+  "restart_service",
+  "upgrade",
+  "docker_restart",
+]
+outcome = "Diagnosis report + remediation proposal awaiting human approval; no automatic remediation."
+
+[triggers]
+kinds = ["alert", "incident", "user"]
+phrases = [
+  "diagnose alert",
+  "why alert",
+  "root cause",
+  "告警诊断",
+  "排障",
+  "CrashLoop",
+  "OOM",
+  "disk full",
+  "5xx",
+]

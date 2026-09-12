@@ -1,0 +1,32 @@
+id = "authorize-upgrade"
+version = "0.1.0"
+description = """
+Propose and execute host upgrades (packages, compose, services) only after explicit human approval.
+Use when: planned upgrade, security patch rollout, compose image bump, controlled prod state change.
+"""
+maturity = "stable"
+permissions = ["observe", "analyze", "propose_execute", "execute"]
+risk_class = "critical"
+allowed_actions = [
+  "docker compose",
+  "systemctl restart",
+  "apt-get",
+  "yum",
+  "dnf",
+]
+requires_human_for = [
+  "upgrade",
+  "prod_state_change",
+]
+outcome = "Upgrade executed only after human approval; verify step required before and after."
+
+[triggers]
+kinds = ["user", "schedule", "incident"]
+phrases = [
+  "authorize upgrade",
+  "upgrade host",
+  "patch rollout",
+  "compose upgrade",
+  "升级",
+  "授权升级",
+]

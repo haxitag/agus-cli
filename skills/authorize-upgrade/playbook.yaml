@@ -1,0 +1,36 @@
+id: authorize-upgrade
+summary: >
+  Verify current state, observe pre-change evidence, propose upgrade plan, await human approval,
+  then execute via Agus executor (never auto-executed by skill runtime).
+steps:
+  - id: verify-pre
+    kind: verify
+    title: Verify pre-upgrade baseline
+    description: Confirm current versions, service health, and rollback prerequisites.
+    command_template: "docker compose ps; systemctl status; apt list --upgradable 2>/dev/null || true"
+    requires_evidence: true
+  - id: observe
+    kind: observe
+    title: Collect pre-change evidence
+    description: Read-only metrics and package/container state before proposing upgrade.
+    command_template: "df -h; free -h; docker ps --format '{{.Names}} {{.Image}}'"
+    requires_evidence: true
+  - id: propose
+    kind: propose
+    title: Propose upgrade plan
+    description: Emit ExecProposal with exact commands; status WaitingApproval.
+    requires_evidence: false
+  - id: await-human
+    kind: await_approval
+    title: Human authorization gate
+    description: Operator must approve before any execute step.
+    requires_evidence: false
+  - id: execute
+    kind: execute
+    title: Execute approved upgrade
+    description: Deferred to Agus executor after approval; skill runtime never self-executes.
+    requires_evidence: true
+pitfalls:
+  - "Executing apt-get / compose / systemctl restart without recorded approval."
+  - "Skipping post-upgrade verify — treat NotProven until fresh evidence."
+  - "Bundling unrelated prod changes into a single upgrade proposal."

@@ -1,0 +1,42 @@
+id: diagnose-alert
+summary: >
+  Codex-workflows style diagnosis — structure problem, investigate, verify, then propose
+  (never execute). SREPowers TDO: verification designed before claiming a fix.
+steps:
+  - id: structure
+    kind: analyze
+    title: Structure the problem
+    description: >
+      Classify change-failure vs new-discovery. Record alert id, host, symptom, onset time.
+    requires_evidence: false
+  - id: verify-symptom
+    kind: verify
+    title: Verify the alert still reproduces
+    description: Re-check the failing condition; if already recovered, verdict may be NotProven for active incident.
+    command_template: "re-evaluate alert rule / curl SLA probe / docker inspect"
+    requires_evidence: true
+  - id: collect
+    kind: observe
+    title: Collect logs and metrics
+    description: Tail relevant logs, container status, disk, ports — read-only.
+    command_template: "docker logs --tail 200 <container>; journalctl -xe -n 100"
+    requires_evidence: true
+  - id: hypothesize
+    kind: analyze
+    title: Hypothesize root cause
+    description: Symptom ≠ root cause (ops-engineering lesson). List ranked hypotheses with evidence links.
+    requires_evidence: false
+  - id: propose-fix
+    kind: propose
+    title: Propose remediation
+    description: Emit ExecProposal with exact commands; status WaitingApproval.
+    requires_evidence: false
+  - id: await-human
+    kind: await_approval
+    title: Human authorization gate
+    description: Agus UI approve_step / CLI asda. Skill runtime never self-approves.
+    requires_evidence: false
+pitfalls:
+  - "Raising limits / restarting services to silence symptoms without confirming leak vs capacity."
+  - "Executing docker restart / systemctl restart from the diagnose skill."
+  - "Declaring Verified without fresh evidence after the proposed fix (use post-fix verify)."

@@ -83,6 +83,25 @@ Agus 内置 **Controlled Automation** 风格的 Ops Skills：观察证据 → �
 | `diagnose-alert` | 告警线索诊断并生成可审批动作提案 |
 | `authorize-upgrade` | 升级授权门禁（人审） |
 
+### Skill 使用说明
+
+1. **发现**：`agus skill list` 列出内置包 + `~/.agus/skills/` 用户包；`agus skill show <id>` 查看权限与步骤。
+2. **运行**：`agus skill run <id> [--host <id>] [--message "..."] [--dry-run] [--yes]`。`--dry-run` 只生成报告/提案；`--yes` 仅对等待审批的提案记录「同意」，**不会直接执行 shell**。
+3. **人审门禁**：若输出中有 `waiting_approval` 提案，用 `agus skill approve <run_id> <proposal_id>` 或 `agus skill reject ...` 处理。
+4. **报告**：`agus skill reports [--limit 20]`；落盘目录为 `~/.agus/skill_runs/`（或 `$AGUS_HOME/skill_runs/`）。
+
+常用示例：
+
+```bash
+agus skill list
+agus skill show diagnose-alert
+agus skill run diagnose-alert --message "disk 93% full" --dry-run
+agus skill run inspect-host --host prod-1
+agus skill approve <run_id> <proposal_id>
+agus skill reject <run_id> <proposal_id>
+agus skill reports --limit 20
+```
+
 扩展方式（无需改核心代码）：
 
 ```text
@@ -93,8 +112,6 @@ Agus 内置 **Controlled Automation** 风格的 Ops Skills：观察证据 → �
 ```
 
 同 id 的用户包会覆盖内置包。也可用 `AGUS_SKILLS_DIR` 指定另一套内置根目录。
-
-报告落盘：`~/.agus/skill_runs/`（或 `$AGUS_HOME/skill_runs/`）。
 
 ## 激活与配额
 
@@ -107,6 +124,11 @@ Agus 内置 **Controlled Automation** 风格的 Ops Skills：观察证据 → �
 | 帮助 | `agus --help` 或 `agus <command> --help` |
 | 主机管理 | `agus host list/show/check` |
 | 执行命令 | `agus exec <host-id> "命令"` |
-| Ops Skills | `agus skill list/show/run/approve/reject/reports` |
+| 列出 Skills | `agus skill list` |
+| 查看 Skill | `agus skill show <id>` |
+| 运行 Skill | `agus skill run <id> [--host ...] [--message ...] [--dry-run] [--yes]` |
+| 批准提案 | `agus skill approve <run_id> <proposal_id>` |
+| 拒绝提案 | `agus skill reject <run_id> <proposal_id>` |
+| Skill 报告 | `agus skill reports [--limit 20]` |
 | 查看日志 | `agus logs <host-id>` |
 | 监控 | `agus monitor <host-id>` |

@@ -26,6 +26,9 @@ pub struct StoredSkillRun {
     pub trigger: String,
     pub status: SkillRunStatus,
     pub report: SkillReport,
+    /// Host used for observe/execute when known (optional for back-compat).
+    #[serde(default)]
+    pub host_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -100,6 +103,7 @@ impl SkillRunStore {
         trigger: &str,
         status: SkillRunStatus,
         report: &SkillReport,
+        host_id: Option<String>,
     ) -> Result<StoredSkillRun, StoreError> {
         fs::create_dir_all(&self.root)?;
         let stored = StoredSkillRun {
@@ -109,6 +113,7 @@ impl SkillRunStore {
             trigger: trigger.into(),
             status,
             report: report.clone(),
+            host_id,
         };
         let raw = serde_json::to_string_pretty(&stored)?;
         fs::write(self.run_path(&stored.run_id), raw)?;

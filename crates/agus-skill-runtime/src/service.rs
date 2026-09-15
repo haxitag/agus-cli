@@ -114,11 +114,12 @@ impl SkillService {
         let summary = format!("readonly run for {skill_id}");
         let report = rt.finish_report(&run, &summary);
         self.store
-            .save_report(trigger, run.status, &report)?;
+            .save_report(trigger, run.status, &report, None)?;
         Ok(report)
     }
 
     /// Diagnose + propose path; proposals stay WaitingApproval unless caller approves elsewhere.
+    /// Does NOT inject synthetic evidence — empty evidence yields NotProven (honest).
     pub fn run_diagnose_with_proposals(
         &self,
         skill_id: &str,
@@ -126,25 +127,11 @@ impl SkillService {
         findings: Vec<String>,
         evidence: Vec<SkillEvidence>,
         actions: Option<(String, String, Vec<String>)>,
+        host_id: Option<String>,
     ) -> Result<SkillReport, ServiceError> {
         let pkg = self.get(skill_id)?.clone();
         let rt = SkillRuntime::new(pkg);
         let mut run = rt.start(trigger)?;
-        let mut evidence = evidence;
-        // Always keep at least synthetic evidence so verdict isn't vacuously NotProven
-        // when callers only pass a message (CLI/UI without host metrics).
-        if evidence.is_empty() {
-            let summary = findings
-                .first()
-                .cloned()
-                .unwrap_or_else(|| trigger.to_string());
-            evidence.push(SkillRuntime::now_evidence(
-                "trigger",
-                &summary,
-                None,
-                Some("synthetic"),
-            ));
-        }
         for ev in evidence {
             SkillRuntime::record_evidence(&mut run, ev);
         }
@@ -160,7 +147,7 @@ impl SkillService {
         let summary = format!("diagnose run for {skill_id}");
         let report = rt.finish_report(&run, &summary);
         self.store
-            .save_report(trigger, run.status, &report)?;
+            .save_report(trigger, run.status, &report, host_id)?;
         Ok(report)
     }
 
@@ -175,6 +162,39 @@ impl SkillService {
         let rt = SkillRuntime::new(pkg);
         let mut run = stored_to_run(&stored);
         rt.approve_proposal(&mut run, proposal_id, approved)?;
+        let report = rt.finish_report(&run, &stored.report.summary);
+        stored.status = run.status;
+        stored.report = report.clone();
+        self.store.update_stored(&stored)?;
+        Ok(report)
+    }
+
+    /// Attach real post-execution evidence after allowlisted commands ran outside this crate.
+    pub fn record_execution_outcomes(
+        &self,
+        run_id: &str,
+        evidence: Vec<SkillEvidence>,
+        all_succeeded: bool,
+        note: &str,
+    ) -> Result<SkillReport, ServiceError> {
+        let mut stored = self.store.load_report(run_id)?;
+        let pkg = self.get(&stored.skill_id)?.clone();
+        let rt = SkillRuntime::new(pkg);
+        let mut run = stored_to_run(&stored);
+        if run.status != crate::runtime::SkillRunStatus::ApprovedPendingExecution
+            && !run
+                .proposals
+                .iter()
+                .any(|p| p.status == crate::proposal::ProposalStatus::Approved)
+        {
+            return Err(ServiceError::Msg(
+                "proposal must be approved before recording execution outcomes".into(),
+            ));
+        }
+        for ev in evidence {
+            SkillRuntime::record_evidence(&mut run, ev);
+        }
+        SkillRuntime::mark_execution_finished(&mut run, all_succeeded, note);
         let report = rt.finish_report(&run, &stored.report.summary);
         stored.status = run.status;
         stored.report = report.clone();

@@ -54,7 +54,7 @@ pub struct Executor {
     failure_steps: HashSet<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbMigrationSpec {
     pub plan_id: String,
     pub connection: DbConnectionConfig,
@@ -211,6 +211,85 @@ impl Executor {
         .map(|session| session.with_log_stream(log_stream))
     }
 
+    pub fn resume_nginx<C: SshClient + Send + Sync + 'static, P: AsRef<Path>>(
+        &self,
+        path: P,
+        host: HostContext,
+        client: C,
+    ) -> Result<ExecutionSession, ExecutionError> {
+        let checkpoint_path = path.as_ref().to_path_buf();
+        let checkpoint = ExecutionSession::read_checkpoint(&checkpoint_path)?;
+        let configs = checkpoint.mode_payload.nginx_configs.clone();
+        if configs.is_empty() {
+            return Err(ExecutionError::SessionError {
+                message: "nginx checkpoint missing mode_payload.nginx_configs; cannot resume"
+                    .to_string(),
+            });
+        }
+        ExecutionSession::from_checkpoint(
+            checkpoint,
+            checkpoint_path,
+            ExecutionMode::Nginx {
+                host,
+                client: Box::new(client),
+                configs,
+            },
+        )
+    }
+
+    pub fn resume_ssl<C: SshClient + Send + Sync + 'static, P: AsRef<Path>>(
+        &self,
+        path: P,
+        host: HostContext,
+        client: C,
+    ) -> Result<ExecutionSession, ExecutionError> {
+        let checkpoint_path = path.as_ref().to_path_buf();
+        let checkpoint = ExecutionSession::read_checkpoint(&checkpoint_path)?;
+        let configs = checkpoint.mode_payload.ssl_configs.clone();
+        if configs.is_empty() {
+            return Err(ExecutionError::SessionError {
+                message: "ssl checkpoint missing mode_payload.ssl_configs; cannot resume"
+                    .to_string(),
+            });
+        }
+        ExecutionSession::from_checkpoint(
+            checkpoint,
+            checkpoint_path,
+            ExecutionMode::Ssl {
+                host,
+                client: Box::new(client),
+                configs,
+            },
+        )
+    }
+
+    pub fn resume_db_migration<C: SshClient + Send + Sync + 'static, P: AsRef<Path>>(
+        &self,
+        path: P,
+        host: HostContext,
+        client: C,
+    ) -> Result<ExecutionSession, ExecutionError> {
+        let checkpoint_path = path.as_ref().to_path_buf();
+        let checkpoint = ExecutionSession::read_checkpoint(&checkpoint_path)?;
+        let migrations = checkpoint.mode_payload.db_migrations.clone();
+        if migrations.is_empty() {
+            return Err(ExecutionError::SessionError {
+                message:
+                    "db_migration checkpoint missing mode_payload.db_migrations; cannot resume"
+                        .to_string(),
+            });
+        }
+        ExecutionSession::from_checkpoint(
+            checkpoint,
+            checkpoint_path,
+            ExecutionMode::DbMigration {
+                host,
+                client: Box::new(client),
+                migrations,
+            },
+        )
+    }
+
     pub fn start_nginx<C: SshClient + Send + Sync + 'static>(
         &self,
         plan: DeploymentPlan,
@@ -306,6 +385,16 @@ pub struct ExecutionSession {
     log_stream: Option<LogStreamSender>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CheckpointModePayload {
+    #[serde(default)]
+    nginx_configs: HashMap<String, NginxProjectConfig>,
+    #[serde(default)]
+    ssl_configs: HashMap<String, SslProjectConfig>,
+    #[serde(default)]
+    db_migrations: HashMap<String, DbMigrationSpec>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecutionCheckpoint {
     steps_by_id: HashMap<String, DeploymentStep>,
@@ -318,6 +407,9 @@ struct ExecutionCheckpoint {
     host_id: String,
     environment: Environment,
     mode_type: String, // "DryRun", "Compose", etc.
+    /// Mode-specific configs required to resume Nginx/Ssl/DbMigration after process restart.
+    #[serde(default)]
+    mode_payload: CheckpointModePayload,
 }
 
 pub(crate) enum ExecutionMode {
@@ -457,6 +549,22 @@ impl ExecutionSession {
                 ExecutionMode::DbMigration { .. } => "DbMigration",
             };
 
+            let mode_payload = match &self.mode {
+                ExecutionMode::Nginx { configs, .. } => CheckpointModePayload {
+                    nginx_configs: configs.clone(),
+                    ..CheckpointModePayload::default()
+                },
+                ExecutionMode::Ssl { configs, .. } => CheckpointModePayload {
+                    ssl_configs: configs.clone(),
+                    ..CheckpointModePayload::default()
+                },
+                ExecutionMode::DbMigration { migrations, .. } => CheckpointModePayload {
+                    db_migrations: migrations.clone(),
+                    ..CheckpointModePayload::default()
+                },
+                _ => CheckpointModePayload::default(),
+            };
+
             let checkpoint = ExecutionCheckpoint {
                 steps_by_id: self.steps_by_id.clone(),
                 order: self.order.clone(),
@@ -468,6 +576,7 @@ impl ExecutionSession {
                 host_id: host_id.to_string(),
                 environment,
                 mode_type: mode_type.to_string(),
+                mode_payload,
             };
 
             if let Some(parent) = checkpoint_path.parent() {
@@ -489,21 +598,20 @@ impl ExecutionSession {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn load_checkpoint(
-        path: &PathBuf,
-        mode: ExecutionMode,
-    ) -> Result<Self, ExecutionError> {
+    fn read_checkpoint(path: &PathBuf) -> Result<ExecutionCheckpoint, ExecutionError> {
         let content = std::fs::read_to_string(path).map_err(|e| ExecutionError::SessionError {
             message: format!("failed to read checkpoint: {}", e),
         })?;
+        serde_json::from_str(&content).map_err(|e| ExecutionError::SessionError {
+            message: format!("failed to parse checkpoint: {}", e),
+        })
+    }
 
-        let checkpoint: ExecutionCheckpoint =
-            serde_json::from_str(&content).map_err(|e| ExecutionError::SessionError {
-                message: format!("failed to parse checkpoint: {}", e),
-            })?;
-
-        // Verify mode type matches
+    fn from_checkpoint(
+        checkpoint: ExecutionCheckpoint,
+        path: PathBuf,
+        mode: ExecutionMode,
+    ) -> Result<Self, ExecutionError> {
         let expected_mode_type = match &mode {
             ExecutionMode::DryRun { .. } => "DryRun",
             ExecutionMode::SshReadonly { .. } => "SshReadonly",
@@ -532,9 +640,18 @@ impl ExecutionSession {
             records: checkpoint.records,
             mode,
             progress_callback: None,
-            checkpoint_path: Some(path.clone()),
-            log_stream: None, // Checkpoint doesn't preserve log stream
+            checkpoint_path: Some(path),
+            log_stream: None,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn load_checkpoint(
+        path: &PathBuf,
+        mode: ExecutionMode,
+    ) -> Result<Self, ExecutionError> {
+        let checkpoint = Self::read_checkpoint(path)?;
+        Self::from_checkpoint(checkpoint, path.clone(), mode)
     }
 
     pub fn run(&mut self) -> Result<Vec<ExecutionRecord>, ExecutionError> {
@@ -606,9 +723,10 @@ impl ExecutionSession {
             .get(step_id)
             .ok_or_else(|| ExecutionError::UnknownStep {
                 step_id: step_id.to_string(),
-            })?;
+            })?
+            .clone();
 
-        match &step.action {
+        let outcome = match &step.action {
             DeploymentAction::ComposeUp { project_dir } => match &self.mode {
                 ExecutionMode::Compose { host, client } => {
                     let command = build_compose_command(project_dir, ComposeCommand::Down)
@@ -618,40 +736,96 @@ impl ExecutionSession {
                     if let Some(ref stream) = self.log_stream {
                         stream.warning(&step_id, &format!("Rollback step {}", step_id));
                     }
-                    let outcome = run_ssh_command_with_log(
+                    let mut outcome = run_ssh_command_with_log(
                         client.as_ref(),
                         &target,
                         &command,
                         self.log_stream.as_ref(),
                         &step_id,
                     );
-
                     logs.extend(outcome.logs);
-                    let final_status = if outcome.status == ExecutionStatus::Succeeded {
-                        ExecutionStatus::RolledBack
-                    } else {
-                        ExecutionStatus::Failed
-                    };
-                    let record = ExecutionRecord {
-                        step_id: step_id.to_string(),
-                        status: final_status.clone(),
-                        started_at: None,
-                        finished_at: None,
-                        logs,
-                        error: outcome.error,
-                    };
-                    self.records.push(record);
-                    self.statuses.insert(step_id.to_string(), final_status);
-                    Ok(self.records.clone())
+                    outcome.logs = logs;
+                    outcome
                 }
-                _ => Err(ExecutionError::RollbackNotSupported {
-                    message: "compose rollback requires compose execution mode".to_string(),
-                }),
+                _ => {
+                    return Err(ExecutionError::RollbackNotSupported {
+                        message: "compose rollback requires compose execution mode".to_string(),
+                    });
+                }
             },
-            _ => Err(ExecutionError::RollbackNotSupported {
-                message: format!("rollback not supported for step {step_id}"),
-            }),
-        }
+            DeploymentAction::NginxApply { project } => match &self.mode {
+                ExecutionMode::Nginx { host, client, .. } => {
+                    if let Some(ref stream) = self.log_stream {
+                        stream.warning(&step_id, &format!("Rollback nginx apply {project}"));
+                    }
+                    execute_nginx_rollback(client.as_ref(), host, project)
+                }
+                _ => {
+                    return Err(ExecutionError::RollbackNotSupported {
+                        message: "nginx rollback requires nginx execution mode".to_string(),
+                    });
+                }
+            },
+            DeploymentAction::SslIssue { project } | DeploymentAction::SslRenew { project } => {
+                match &self.mode {
+                    ExecutionMode::Ssl {
+                        host,
+                        client,
+                        configs,
+                    } => {
+                        let config = configs.get(project).ok_or_else(|| {
+                            ExecutionError::RollbackNotSupported {
+                                message: format!(
+                                    "ssl config for project {project} missing from session; cannot rollback"
+                                ),
+                            }
+                        })?;
+                        if let Some(ref stream) = self.log_stream {
+                            stream.warning(&step_id, &format!("Rollback ssl {project}"));
+                        }
+                        execute_ssl_rollback(client.as_ref(), host, config)
+                    }
+                    _ => {
+                        return Err(ExecutionError::RollbackNotSupported {
+                            message: "ssl rollback requires ssl execution mode".to_string(),
+                        });
+                    }
+                }
+            },
+            DeploymentAction::DbMigrate { plan_id } => {
+                return Err(ExecutionError::RollbackNotSupported {
+                    message: format!(
+                        "db migrate rollback not supported for plan {plan_id} (no down_sql / snapshot model yet)"
+                    ),
+                });
+            }
+            other => {
+                return Err(ExecutionError::RollbackNotSupported {
+                    message: format!("rollback not supported for action {other:?} on step {step_id}"),
+                });
+            }
+        };
+
+        let final_status = if outcome.status == ExecutionStatus::Succeeded {
+            ExecutionStatus::RolledBack
+        } else {
+            ExecutionStatus::Failed
+        };
+        let record = ExecutionRecord {
+            step_id: step_id.to_string(),
+            status: final_status.clone(),
+            started_at: None,
+            finished_at: None,
+            logs: {
+                let mut logs = vec![format!("Rollback step {step_id}")];
+                logs.extend(outcome.logs);
+                logs
+            },
+            error: outcome.error,
+        };
+        self.records.push(record);
+        self.statuses.insert(step_id.to_string(), final_status);
+        Ok(self.records.clone())
     }
 
     fn run_until_pause(&mut self, pause_after_each_step: bool) -> Result<(), ExecutionError> {
@@ -1462,6 +1636,19 @@ fn execute_nginx_apply(
     }
 
     let config_path = nginx_config_path(&config.project);
+    let backup_command = format!(
+        "if [ -f {config_path} ]; then cp -a -- {config_path} {config_path}.agus.bak; fi"
+    );
+    logs.push(format!("command: {backup_command}"));
+    if let Err(err) = client.execute(&target, &backup_command) {
+        append_error_logs(&mut logs, &err);
+        return StepOutcome {
+            status: ExecutionStatus::Failed,
+            logs,
+            error: Some(format!("failed to backup existing nginx config: {err}")),
+        };
+    }
+
     let write_command = build_nginx_write_command(&config_path, &config_text);
     logs.push(format!("command: write nginx config {config_path}"));
     if let Err(err) = client.execute(&target, &write_command) {
@@ -1519,14 +1706,29 @@ fn execute_nginx_rollback(
     let target = host_target(host);
     let mut logs = Vec::new();
     let config_path = nginx_config_path(project);
-    let remove_command = format!("rm -f -- {config_path}");
-    logs.push(format!("command: {remove_command}"));
-    if let Err(err) = client.execute(&target, &remove_command) {
+    let bak_path = format!("{config_path}.agus.bak");
+    // Prefer restore previous config; fall back to removing the Agus-managed file.
+    let restore_or_remove = format!(
+        "if [ -f {bak_path} ]; then mv -f -- {bak_path} {config_path}; else rm -f -- {config_path}; fi"
+    );
+    logs.push(format!("command: {restore_or_remove}"));
+    if let Err(err) = client.execute(&target, &restore_or_remove) {
         append_error_logs(&mut logs, &err);
         return StepOutcome {
             status: ExecutionStatus::Failed,
             logs,
             error: Some(err.to_string()),
+        };
+    }
+
+    let test_command = "nginx -t";
+    logs.push(format!("command: {test_command}"));
+    if let Err(err) = client.execute(&target, test_command) {
+        append_error_logs(&mut logs, &err);
+        return StepOutcome {
+            status: ExecutionStatus::Failed,
+            logs,
+            error: Some(format!("nginx -t failed after rollback: {err}")),
         };
     }
 
@@ -3028,6 +3230,108 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.contains("command: cd -- /srv/app && docker compose down")));
+    }
+
+    #[test]
+    fn rollback_nginx_apply_restores_or_removes_config() {
+        let plan = DeploymentPlan {
+            steps: vec![DeploymentStep {
+                id: "nginx:apply".to_string(),
+                service_name: "nginx".to_string(),
+                action: DeploymentAction::NginxApply {
+                    project: "demo".to_string(),
+                },
+                depends_on: Vec::new(),
+                approval_required: true,
+                memo: None,
+            }],
+        };
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = RecordingSshClient::new(HashMap::new(), commands.clone());
+        let host = HostContext {
+            host: "127.0.0.1".to_string(),
+            user: "tester".to_string(),
+            port: 22,
+            environment: Environment::Dev,
+        };
+        let executor = Executor::new();
+        let mut session = executor
+            .start_nginx(
+                plan,
+                host,
+                client,
+                vec![nginx_config("demo", "http://localhost")],
+            )
+            .expect("start");
+        session.run().expect("wait approval");
+        session.approve_step("nginx:apply").expect("apply");
+        let records = session.rollback_step("nginx:apply").expect("rollback");
+        let record = records
+            .iter()
+            .rev()
+            .find(|r| r.step_id == "nginx:apply")
+            .expect("rollback record");
+        assert!(matches!(record.status, ExecutionStatus::RolledBack));
+        let cmds = commands.lock().expect("lock");
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains(".agus.bak") || c.contains("rm -f")),
+            "expected restore/remove command, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn nginx_checkpoint_resume_preserves_configs() {
+        let ckpt = std::env::temp_dir().join(format!(
+            "agus-nginx-ckpt-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&ckpt);
+        let plan = DeploymentPlan {
+            steps: vec![DeploymentStep {
+                id: "nginx:apply".to_string(),
+                service_name: "nginx".to_string(),
+                action: DeploymentAction::NginxApply {
+                    project: "demo".to_string(),
+                },
+                depends_on: Vec::new(),
+                approval_required: true,
+                memo: None,
+            }],
+        };
+        let host = HostContext {
+            host: "127.0.0.1".to_string(),
+            user: "tester".to_string(),
+            port: 22,
+            environment: Environment::Dev,
+        };
+        let executor = Executor::new();
+        let mut session = executor
+            .start_nginx(
+                plan,
+                host.clone(),
+                RecordingSshClient::new(HashMap::new(), std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+                vec![nginx_config("demo", "http://localhost")],
+            )
+            .expect("start")
+            .with_checkpoint(ckpt.clone());
+        session.run().expect("pause");
+        session
+            .save_checkpoint("exec-nginx-1", "host-1", Environment::Dev)
+            .expect("save");
+
+        let resumed = executor
+            .resume_nginx(
+                &ckpt,
+                host,
+                RecordingSshClient::new(HashMap::new(), std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+            )
+            .expect("resume");
+        assert_eq!(
+            resumed.pending_approval_step().as_deref(),
+            Some("nginx:apply")
+        );
+        let _ = std::fs::remove_file(&ckpt);
     }
 
     fn nginx_config(project: &str, proxy_pass: &str) -> NginxProjectConfig {

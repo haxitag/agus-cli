@@ -43,11 +43,13 @@ pub struct ExecProposal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationVerdict {
-    /// Fresh evidence supports success claims.
+    /// Fresh execution/observe evidence supports success claims.
     Verified,
     Failed,
     /// AgentOps lesson: missing / stale evidence is not success.
     NotProven,
+    /// Human approved a proposal; remediation commands have NOT been verified yet.
+    ApprovedPendingExecution,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

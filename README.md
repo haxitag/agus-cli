@@ -12,8 +12,8 @@ Releases（含 **Agus CLI**、**Agus GUI** 与 **HaxiTAG Base** 安装包）：h
 
 ```bash
 # 拉取 CLI 包（版本号以 Releases 页面为准）
-tar -xzf agus-cli-0.2.8-macos-aarch64.tar.gz
-cd agus-cli-0.2.8-macos-aarch64
+tar -xzf agus-cli-0.2.9-macos-aarch64.tar.gz
+cd agus-cli-0.2.9-macos-aarch64
 bash install_cli.sh
 ```
 

@@ -16,6 +16,8 @@ pub enum SkillRunStatus {
     Pending,
     Running,
     WaitingHumanApproval,
+    /// Human approved; allowlisted actions not yet executed (or only partially).
+    ApprovedPendingExecution,
     Completed,
     Failed,
     Rejected,
@@ -226,29 +228,68 @@ impl SkillRuntime {
         if !approved {
             run.status = SkillRunStatus::Rejected;
         } else {
-            // Execution still happens outside; mark completed proposal phase.
-            run.status = SkillRunStatus::Completed;
-            run.log
-                .push("approved; hand off to agus-executor / classified exec".into());
+            // Approval ≠ execution. Keep an honest pending state until a real
+            // classified exec path records post-execution evidence.
+            run.status = SkillRunStatus::ApprovedPendingExecution;
+            run.log.push(
+                "approved; awaiting execute_skill_proposal / classified allowlisted exec".into(),
+            );
         }
         Ok(())
     }
 
+    /// Record that allowlisted remediation commands were attempted after approval.
+    /// Callers must supply real command outcomes as evidence (never synthetic).
+    pub fn mark_execution_finished(
+        run: &mut SkillRun,
+        all_succeeded: bool,
+        note: impl Into<String>,
+    ) {
+        let note = note.into();
+        run.log.push(note);
+        run.status = if all_succeeded {
+            SkillRunStatus::Completed
+        } else {
+            SkillRunStatus::Failed
+        };
+    }
+
     pub fn finish_report(&self, run: &SkillRun, summary: &str) -> SkillReport {
-        let verdict = if run.status == SkillRunStatus::Rejected {
-            VerificationVerdict::Failed
-        } else if run.evidence.is_empty() {
-            VerificationVerdict::NotProven
-        } else if run.status == SkillRunStatus::Failed {
-            VerificationVerdict::Failed
-        } else if run
+        let has_approved = run
             .proposals
             .iter()
-            .any(|p| p.requires_human && p.status == ProposalStatus::WaitingApproval)
-        {
+            .any(|p| p.status == ProposalStatus::Approved);
+        let has_waiting = run
+            .proposals
+            .iter()
+            .any(|p| p.requires_human && p.status == ProposalStatus::WaitingApproval);
+        let has_exec_evidence = run.evidence.iter().any(|e| {
+            e.kind == "exec_result" || e.digest.as_deref() == Some("exec_ok") || e.digest.as_deref() == Some("exec_fail")
+        });
+        // Trigger-only / synthetic digests do not count as proof.
+        let has_real_observe = run.evidence.iter().any(|e| {
+            e.digest.as_deref() != Some("synthetic")
+                && e.kind != "trigger"
+                && !e.summary.trim().is_empty()
+        });
+
+        let verdict = if run.status == SkillRunStatus::Rejected {
+            VerificationVerdict::Failed
+        } else if run.status == SkillRunStatus::Failed {
+            VerificationVerdict::Failed
+        } else if run.status == SkillRunStatus::ApprovedPendingExecution || (has_approved && !has_exec_evidence) {
+            VerificationVerdict::ApprovedPendingExecution
+        } else if has_waiting {
             VerificationVerdict::NotProven
-        } else {
+        } else if run.evidence.is_empty() || !has_real_observe {
+            VerificationVerdict::NotProven
+        } else if has_approved && has_exec_evidence && run.status == SkillRunStatus::Completed {
             VerificationVerdict::Verified
+        } else if !has_approved && has_real_observe && run.status == SkillRunStatus::Completed {
+            // Readonly inspect path: evidence collected, no write proposals.
+            VerificationVerdict::Verified
+        } else {
+            VerificationVerdict::NotProven
         };
 
         SkillReport {

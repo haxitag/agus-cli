@@ -118,7 +118,32 @@ impl SkillRunStore {
         let raw = serde_json::to_string_pretty(&stored)?;
         fs::write(self.run_path(&stored.run_id), raw)?;
         self.upsert_index(&stored)?;
+        // Keep production skill_runs bounded (alert daemon used to write every 60s).
+        let _ = self.prune_to_max(Self::DEFAULT_MAX_KEEP);
         Ok(stored)
+    }
+
+    /// Newest-first retention. Returns number of removed run files.
+    pub const DEFAULT_MAX_KEEP: usize = 500;
+
+    pub fn prune_to_max(&self, max_keep: usize) -> Result<usize, StoreError> {
+        if max_keep == 0 {
+            return Ok(0);
+        }
+        let mut index = self.load_index()?;
+        if index.runs.len() <= max_keep {
+            return Ok(0);
+        }
+        // Index is sorted newest-first in upsert_index.
+        let removed: Vec<_> = index.runs.drain(max_keep..).collect();
+        let mut n = 0usize;
+        for entry in &removed {
+            if fs::remove_file(self.run_path(&entry.run_id)).is_ok() {
+                n += 1;
+            }
+        }
+        self.save_index(&index)?;
+        Ok(n)
     }
 
     pub fn update_stored(&self, stored: &StoredSkillRun) -> Result<(), StoreError> {

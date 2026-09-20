@@ -126,8 +126,8 @@ fn run_skill(svc: &SkillService, args: &SkillRunArgs) -> Result<SkillReport, Cli
         .any(|p| matches!(p, agus_skill_runtime::Permission::ProposeExecute));
 
     let report = if propose_capable {
-        // dry_run drafts allowlisted proposals; --yes only approves (never executes).
-        // Use `agus skill execute` (or UI execute) after approve for real SSH remediation.
+        // dry_run drafts allowlisted proposals without persisting; --yes only approves (never executes).
+        // Use UI execute after approve for real SSH remediation.
         svc.run_diagnose_with_proposals(
             &args.id,
             &trigger,
@@ -135,9 +135,17 @@ fn run_skill(svc: &SkillService, args: &SkillRunArgs) -> Result<SkillReport, Cli
             evidence,
             None,
             args.host.clone(),
+            !args.dry_run,
         )
     } else {
-        svc.run_readonly(&args.id, &trigger, findings, evidence)
+        svc.run_readonly(
+            &args.id,
+            &trigger,
+            findings,
+            evidence,
+            args.host.clone(),
+            !args.dry_run,
+        )
     }
     .map_err(|e| CliError::Config(e.to_string()))?;
 

@@ -63,6 +63,37 @@ pub fn load_skill_dir(dir: impl AsRef<Path>) -> Result<SkillPackage, LoadError> 
         ));
     }
 
+    // Fail-closed: any write-capable skill must declare an allowlist (custom skills included).
+    let write_capable = manifest.has_permission(crate::Permission::ProposeExecute)
+        || manifest.has_permission(crate::Permission::Execute)
+        || manifest.has_permission(crate::Permission::Plan);
+    if write_capable && manifest.allowed_actions.is_empty() {
+        return Err(LoadError::Invalid(
+            root,
+            "propose_execute/plan/execute requires non-empty allowed_actions".into(),
+        ));
+    }
+
+    // Refuse absolute / shell-metachar prefixes that would punch through allowlist matching.
+    for action in &manifest.allowed_actions {
+        let trimmed = action.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('/')
+            || trimmed.contains("..")
+            || trimmed.contains('|')
+            || trimmed.contains(';')
+            || trimmed.contains('&')
+            || trimmed.contains('`')
+            || trimmed.contains('$')
+            || trimmed.contains('\n')
+        {
+            return Err(LoadError::Invalid(
+                root,
+                format!("unsafe allowed_actions entry: {action}"),
+            ));
+        }
+    }
+
     let playbook_path = root.join("playbook.yaml");
     if !playbook_path.is_file() {
         return Err(LoadError::Invalid(root, "missing playbook.yaml".into()));

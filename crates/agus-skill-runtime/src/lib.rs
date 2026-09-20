@@ -23,7 +23,8 @@ pub use manifest::{
 };
 pub use playbook::{Playbook, PlaybookStep, StepKind};
 pub use proposal::{
-    ExecProposal, ProposalStatus, SkillEvidence, SkillReport, VerificationVerdict,
+    format_skill_report_for_copilot, render_analyze_prompt_template, ExecProposal, ProposalStatus,
+    SkillEvidence, SkillReport, VerificationVerdict,
 };
 pub use runtime::{SkillRun, SkillRunStatus, SkillRuntime};
 pub use service::{resolve_agus_home, SkillService, SkillSummary, ServiceError};

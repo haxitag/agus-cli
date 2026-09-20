@@ -59,9 +59,13 @@ impl SkillService {
     }
 
     pub fn with_home(agus_home: impl Into<PathBuf>) -> Result<Self, ServiceError> {
+        let home = agus_home.into();
+        let store = SkillRunStore::new(&home);
+        // Heal unbounded skill_runs on every service open (daemon / CLI / UI).
+        let _ = store.prune_to_max(SkillRunStore::DEFAULT_MAX_KEEP);
         Ok(Self {
             catalog: SkillCatalog::discover()?,
-            store: SkillRunStore::new(agus_home.into()),
+            store,
         })
     }
 
@@ -95,12 +99,15 @@ impl SkillService {
     }
 
     /// Read-only analyze path: observe/analyze skills, no proposals.
+    /// When `persist` is false (CLI `--dry-run`), report is returned without writing skill_runs.
     pub fn run_readonly(
         &self,
         skill_id: &str,
         trigger: &str,
         findings: Vec<String>,
         evidence: Vec<SkillEvidence>,
+        host_id: Option<String>,
+        persist: bool,
     ) -> Result<SkillReport, ServiceError> {
         let pkg = self.get(skill_id)?.clone();
         let rt = SkillRuntime::new(pkg);
@@ -113,13 +120,16 @@ impl SkillService {
         }
         let summary = format!("readonly run for {skill_id}");
         let report = rt.finish_report(&run, &summary);
-        self.store
-            .save_report(trigger, run.status, &report, None)?;
+        if persist {
+            self.store
+                .save_report(trigger, run.status, &report, host_id)?;
+        }
         Ok(report)
     }
 
     /// Diagnose + propose path; proposals stay WaitingApproval unless caller approves elsewhere.
     /// Does NOT inject synthetic evidence — empty evidence yields NotProven (honest).
+    /// When `persist` is false (CLI `--dry-run`), nothing is written under skill_runs.
     pub fn run_diagnose_with_proposals(
         &self,
         skill_id: &str,
@@ -128,6 +138,7 @@ impl SkillService {
         evidence: Vec<SkillEvidence>,
         actions: Option<(String, String, Vec<String>)>,
         host_id: Option<String>,
+        persist: bool,
     ) -> Result<SkillReport, ServiceError> {
         let pkg = self.get(skill_id)?.clone();
         let rt = SkillRuntime::new(pkg);
@@ -146,8 +157,10 @@ impl SkillService {
         }
         let summary = format!("diagnose run for {skill_id}");
         let report = rt.finish_report(&run, &summary);
-        self.store
-            .save_report(trigger, run.status, &report, host_id)?;
+        if persist {
+            self.store
+                .save_report(trigger, run.status, &report, host_id)?;
+        }
         Ok(report)
     }
 

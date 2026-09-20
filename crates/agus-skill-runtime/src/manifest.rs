@@ -23,7 +23,8 @@ impl Permission {
     }
 
     pub fn allows_auto_start(self) -> bool {
-        !matches!(self, Self::Execute)
+        // Only pure observe/analyze may auto-start. Propose/Plan/Execute always need a human gate.
+        matches!(self, Self::Observe | Self::Analyze)
     }
 }
 
@@ -107,11 +108,13 @@ impl SkillManifest {
         self.permissions.contains(&need)
     }
 
-    /// Execute is never an auto permission even if listed — higher layers must approve.
+    /// Execute / propose_execute are never auto permissions — higher layers must approve.
     pub fn may_auto_run(&self) -> bool {
         !self.permissions.is_empty()
             && self.permissions.iter().all(|p| p.allows_auto_start())
             && !self.has_permission(Permission::Execute)
+            && !self.has_permission(Permission::ProposeExecute)
+            && !self.has_permission(Permission::Plan)
     }
 
     pub fn matches_phrase(&self, text: &str) -> bool {

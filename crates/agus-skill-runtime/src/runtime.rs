@@ -4,7 +4,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::loader::SkillPackage;
-use crate::manifest::{Permission, RiskClass};
+use crate::manifest::Permission;
 use crate::playbook::StepKind;
 use crate::proposal::{
     ExecProposal, ProposalStatus, SkillEvidence, SkillReport, VerificationVerdict,
@@ -153,23 +153,26 @@ impl SkillRuntime {
         {
             return Err(RuntimeError::MissingPermission("propose_execute|plan"));
         }
-        // Enforce allowlist when present.
-        if !self.package.manifest.allowed_actions.is_empty() {
-            for action in &actions {
-                let ok = self.package.manifest.allowed_actions.iter().any(|prefix| {
-                    action == prefix || action.starts_with(prefix) || action.contains(prefix)
-                });
-                if !ok {
-                    return Err(RuntimeError::Msg(format!(
-                        "action not in allowed_actions: {action}"
-                    )));
-                }
+        // Fail-closed: proposals without an allowlist cannot be created (blocks open-ended custom skills).
+        if self.package.manifest.allowed_actions.is_empty() {
+            return Err(RuntimeError::Msg(
+                "allowed_actions is empty; refusing to create proposal (fail-closed)".into(),
+            ));
+        }
+        for action in &actions {
+            let ok = self.package.manifest.allowed_actions.iter().any(|prefix| {
+                action == prefix || action.starts_with(prefix)
+            });
+            if !ok {
+                return Err(RuntimeError::Msg(format!(
+                    "action not in allowed_actions: {action}"
+                )));
             }
         }
 
-        let requires_human = self.package.manifest.risk_class.rank() >= RiskClass::High.rank()
-            || !self.package.manifest.requires_human_for.is_empty()
-            || self.package.manifest.has_permission(Permission::Execute);
+        // Controlled Automation: ANY proposal requires human approval — including custom
+        // medium skills. Draft must never skip the Agus approval / HITL frame.
+        let requires_human = true;
 
         let proposal = ExecProposal {
             id: Uuid::new_v4().to_string(),
@@ -178,20 +181,14 @@ impl SkillRuntime {
             rationale: rationale.into(),
             risk_class: self.package.manifest.risk_class,
             actions,
-            status: if requires_human {
-                ProposalStatus::WaitingApproval
-            } else {
-                ProposalStatus::Draft
-            },
+            status: ProposalStatus::WaitingApproval,
             requires_human,
         };
         run.log.push(format!(
             "proposal {} requires_human={}",
             proposal.id, proposal.requires_human
         ));
-        if requires_human {
-            run.status = SkillRunStatus::WaitingHumanApproval;
-        }
+        run.status = SkillRunStatus::WaitingHumanApproval;
         run.proposals.push(proposal);
         Ok(())
     }
@@ -216,6 +213,12 @@ impl SkillRuntime {
             .iter_mut()
             .find(|p| p.id == proposal_id)
             .ok_or(RuntimeError::NoProposal)?;
+        if proposal.status != ProposalStatus::WaitingApproval {
+            return Err(RuntimeError::Msg(format!(
+                "proposal status is {:?}; only waiting_approval can be approved/rejected",
+                proposal.status
+            )));
+        }
         proposal.status = if approved {
             ProposalStatus::Approved
         } else {
@@ -266,10 +269,15 @@ impl SkillRuntime {
         let has_exec_evidence = run.evidence.iter().any(|e| {
             e.kind == "exec_result" || e.digest.as_deref() == Some("exec_ok") || e.digest.as_deref() == Some("exec_fail")
         });
-        // Trigger-only / synthetic digests do not count as proof.
+        // Trigger-only / synthetic / collection-status digests do not count as proof.
+        // `inspection_status` is used by daemon auto-inspect (metrics_ok/containers_ok/alerts=N)
+        // and must not mint Verified — that was flooding skill_runs with fake greens.
         let has_real_observe = run.evidence.iter().any(|e| {
-            e.digest.as_deref() != Some("synthetic")
+            let digest = e.digest.as_deref();
+            digest != Some("synthetic")
+                && digest != Some("inspection_status")
                 && e.kind != "trigger"
+                && e.kind != "inspection_status"
                 && !e.summary.trim().is_empty()
         });
 

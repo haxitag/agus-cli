@@ -1,6 +1,7 @@
 pub mod alerting;
 pub mod container_health;
 pub mod container_logs;
+pub mod host_runtime_glance;
 pub mod host_system_panel;
 pub mod junk_cleaner;
 pub mod nginx;
@@ -17,6 +18,9 @@ pub use container_health::{ContainerHealth, ContainerHealthCheckResult, Containe
 pub use container_logs::{
     ContainerLogEntry, ContainerLogError, ContainerLogFollowRegistry, ContainerLogMonitor,
     LogLevel, LogStream, SshContainerLogMonitor,
+};
+pub use host_runtime_glance::{
+    collect_host_runtime_glance, GlanceNet, GlanceProcess, HostRuntimeGlance,
 };
 pub use host_system_panel::{
     collect_host_system_panel, HostCpuDetail, HostCpuUsageBreakdown, HostFilesystem, HostMemBlock,

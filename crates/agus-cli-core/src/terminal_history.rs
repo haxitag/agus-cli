@@ -58,6 +58,57 @@ pub fn append_terminal_history(entry: TerminalHistoryEntry) -> Result<(), CliErr
     Ok(())
 }
 
+/// 按主机 + 命令文本删除历史（列表已按这两项去重，一次删掉所有重复行）。
+pub fn delete_terminal_history(host_id: &str, command: &str) -> Result<(), CliError> {
+    let host_id = host_id.trim();
+    let command = command.trim();
+    if host_id.is_empty() || command.is_empty() {
+        return Ok(());
+    }
+    let path = history_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let file = fs::File::open(&path)?;
+    let reader = BufReader::new(file);
+    let mut kept = Vec::new();
+    let mut removed = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<TerminalHistoryEntry>(&line) {
+            if entry.host_id == host_id && entry.command.trim() == command {
+                removed += 1;
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    if removed == 0 {
+        return Ok(());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_file_name(format!(
+        "{}.{nanos}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("terminal_history.jsonl")
+    ));
+    {
+        let mut out = fs::File::create(&tmp)?;
+        for line in &kept {
+            writeln!(out, "{line}")?;
+        }
+    }
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 pub fn list_terminal_history(
     host_id: Option<&str>,
     limit: usize,
@@ -125,4 +176,55 @@ pub fn default_suggested_commands() -> Vec<TerminalHistoryEntry> {
         use_count: 0,
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use tempfile::TempDir;
+
+    fn entry(host_id: &str, command: &str, timestamp: u64) -> TerminalHistoryEntry {
+        TerminalHistoryEntry {
+            host_id: host_id.to_string(),
+            command: command.to_string(),
+            cwd: None,
+            timestamp,
+            source: "web_terminal".to_string(),
+            use_count: 1,
+        }
+    }
+
+    #[test]
+    fn delete_removes_matching_host_command_and_keeps_the_rest() {
+        let _guard = crate::test_support::env_lock();
+        let temp_dir = TempDir::new().expect("temp dir");
+        env::set_var("AGUS_HOME", temp_dir.path().to_string_lossy().to_string());
+
+        append_terminal_history(entry("host-a", "docker compose up -d", 1)).expect("append");
+        append_terminal_history(entry("host-a", "docker compose up -d", 2)).expect("append");
+        append_terminal_history(entry("host-b", "docker compose up -d", 3)).expect("append");
+        append_terminal_history(entry("host-a", "df -h", 4)).expect("append");
+
+        delete_terminal_history("host-a", "docker compose up -d").expect("delete");
+
+        let left = list_terminal_history(None, 20).expect("list");
+        let commands: Vec<_> = left
+            .iter()
+            .map(|item| (item.host_id.as_str(), item.command.as_str()))
+            .collect();
+        assert!(commands.contains(&("host-b", "docker compose up -d")));
+        assert!(commands.contains(&("host-a", "df -h")));
+        assert!(!commands.contains(&("host-a", "docker compose up -d")));
+
+        let leftovers: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("read home")
+            .filter_map(|item| item.ok())
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        env::remove_var("AGUS_HOME");
+    }
 }

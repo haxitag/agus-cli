@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshTarget {
@@ -157,6 +157,21 @@ mod tests {
         std::env::remove_var("AGUS_SSH_COMMAND_TIMEOUT_SECS");
         std::env::remove_var("AGUS_SSH_MAX_RETRIES");
         std::env::remove_var("AGUS_SSH_RETRY_DELAY_MS");
+    }
+
+    #[test]
+    fn askpass_file_does_not_contain_the_password_and_prints_it_once() {
+        let password = "p@ss 'word";
+        let ask = PasswordAskpass::create(password).expect("create");
+        let script = std::fs::read_to_string(ask.script_path()).expect("read script");
+        assert!(!script.contains(password), "script embedded the password");
+        assert!(!script.contains("SSHPASS"));
+        let output = std::process::Command::new(ask.script_path())
+            .output()
+            .expect("run askpass");
+        assert_eq!(output.stdout, format!("{password}\n").into_bytes());
+        assert!(!ask.secret.exists());
+        assert!(!ask.script.exists());
     }
 }
 
@@ -388,6 +403,7 @@ impl ProcessSshClient {
 
     /// 获取 sshpass 可执行文件路径
     /// 优先使用应用 bundle 内的 sshpass，如果不存在则使用系统的
+    #[allow(dead_code)] // 生成的部署脚本仍调用 sshpass；进程内认证已改走 askpass 文件。
     fn get_sshpass_path() -> Option<String> {
         // 首先尝试使用应用 bundle 内的 sshpass
         if let Ok(exe_path) = std::env::current_exe() {
@@ -540,6 +556,7 @@ impl ProcessSshClient {
     }
 
     /// 检查 sshpass 是否可用（检查系统的）
+    #[allow(dead_code)]
     fn is_sshpass_available() -> bool {
         // 尝试运行 sshpass -V，如果命令不存在或执行失败，返回 false
         match Command::new("sshpass")
@@ -600,12 +617,10 @@ impl ProcessSshClient {
         control: &SshControlConfig,
     ) -> Result<(), SshError> {
         let destination = format!("{}@{}", target.user, target.host);
+        let mut _held_askpass = None;
         let mut cmd = if let Some(ref password) = target.password {
-            let sshpass_path = Self::get_sshpass_path().ok_or_else(|| SshError::Connection {
-                message: "sshpass is not available for control master setup".to_string(),
-            })?;
-            let mut cmd = Command::new(&sshpass_path);
-            cmd.arg("-p").arg(password).arg("ssh");
+            let (mut cmd, askpass) = ssh_command_with_password(password)?;
+            _held_askpass = Some(askpass);
 
             // 添加SSH选项
             cmd.arg("-o")
@@ -701,50 +716,11 @@ impl ProcessSshClient {
             self.ensure_control_master(target, control);
         }
 
-        // 如果提供了密码，使用 sshpass；否则使用密钥文件或系统默认密钥
+        // 口令放在 0600 文件里，由 askpass 读一次后删除。不进 argv，也不进环境变量。
+        let mut _held_askpass = None;
         if let Some(ref password) = target.password {
-            // 获取 sshpass 路径（优先使用应用内的）
-            let sshpass_path = Self::get_sshpass_path().ok_or_else(|| {
-                // 提供更详细的错误信息，帮助调试
-                let exe_path = std::env::current_exe()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "unknown".to_string());
-                // 尝试获取 Resources 路径用于调试
-                let resources_info = if let Ok(exe) = std::env::current_exe() {
-                    if let Some(app_path) = exe.parent() {
-                        let resources = app_path
-                            .parent()
-                            .and_then(|p| p.parent())
-                            .map(|p| p.join("Resources"));
-                        if let Some(res) = resources {
-                            format!("Resources path: {}", res.display())
-                        } else {
-                            "Resources path: not found".to_string()
-                        }
-                    } else {
-                        "App path: not found".to_string()
-                    }
-                } else {
-                    "Executable path: unknown".to_string()
-                };
-                
-                let error_msg = format!(
-                    "sshpass is not available. The application requires sshpass for password authentication.\n\
-                    Executable path: {}\n\
-                    {}\n\
-                    \n\
-                    Please ensure:\n\
-                    1. The application was built with the latest version that includes sshpass\n\
-                    2. sshpass is included in the application bundle at Resources/resources/sshpass\n\
-                    3. Or install sshpass on your system: brew install hudochenkov/sshpass/sshpass",
-                    exe_path, resources_info
-                );
-                SshError::Connection { message: error_msg }
-            })?;
-
-            // 使用 sshpass 进行密码认证
-            let mut cmd = Command::new(&sshpass_path);
-            cmd.arg("-p").arg(password).arg("ssh");
+            let (mut cmd, askpass) = ssh_command_with_password(password)?;
+            _held_askpass = Some(askpass);
 
             // 调试：记录ssh命令（不记录密码）
             // Log reduced to avoid spam
@@ -919,16 +895,10 @@ impl ProcessSshClient {
             self.ensure_control_master(target, control);
         }
 
+        let mut _held_askpass = None;
         let mut cmd = if let Some(ref password) = target.password {
-            // 获取 sshpass 路径（优先使用应用内的）
-            let sshpass_path = Self::get_sshpass_path().ok_or_else(|| {
-                return SshError::Connection {
-                    message: "sshpass is not available. The application requires sshpass for password authentication, but it was not found in the application bundle or system PATH.".to_string(),
-                };
-            })?;
-
-            let mut cmd = Command::new(&sshpass_path);
-            cmd.arg("-p").arg(password).arg("ssh");
+            let (mut cmd, askpass) = ssh_command_with_password(password)?;
+            _held_askpass = Some(askpass);
 
             // 添加SSH选项
             cmd.arg("-o")
@@ -1374,3 +1344,92 @@ impl SshClient for SshConnectionPool {
         result
     }
 }
+
+/// 口令写在 0600 文件里。askpass 脚本读一次并删掉文件。
+/// ssh 进程的环境里只有脚本路径，没有口令。
+pub struct PasswordAskpass {
+    script: PathBuf,
+    secret: PathBuf,
+}
+
+impl Drop for PasswordAskpass {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.script);
+        let _ = std::fs::remove_file(&self.secret);
+    }
+}
+
+impl PasswordAskpass {
+    pub fn create(password: &str) -> Result<Self, String> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let secret = std::env::temp_dir().join(format!(
+            "agus-askpass-{}-{stamp}.secret",
+            std::process::id()
+        ));
+        let script = std::env::temp_dir().join(format!(
+            "agus-askpass-{}-{stamp}.sh",
+            std::process::id()
+        ));
+        std::fs::write(&secret, password.as_bytes()).map_err(|err| format!("写入口令文件失败: {err}"))?;
+        set_owner_mode(&secret, 0o600)?;
+        let body = format!(
+            "#!/bin/sh\n/bin/cat {}\nprintf '\\n'\n/bin/rm -f {} {}\n",
+            sh_single_quote(&secret.to_string_lossy()),
+            sh_single_quote(&secret.to_string_lossy()),
+            sh_single_quote(&script.to_string_lossy()),
+        );
+        std::fs::write(&script, body).map_err(|err| format!("写入密码助手失败: {err}"))?;
+        set_owner_mode(&script, 0o700)?;
+        Ok(Self { script, secret })
+    }
+
+    pub fn script_path(&self) -> &std::path::Path {
+        &self.script
+    }
+
+    pub fn apply(&self, cmd: &mut Command) {
+        cmd.env("SSH_ASKPASS", &self.script)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", "agus-askpass");
+    }
+
+    /// 交给另一个进程（系统终端）之后再读。脚本自己删除文件。
+    pub fn hand_off(self) -> PathBuf {
+        let script = self.script.clone();
+        std::mem::forget(self);
+        script
+    }
+}
+
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn set_owner_mode(path: &std::path::Path, mode: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|err| format!("设置权限失败: {err}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+fn ssh_command_with_password(password: &str) -> Result<(Command, PasswordAskpass), SshError> {
+    let askpass = PasswordAskpass::create(password).map_err(|message| SshError::Connection { message })?;
+    let mut cmd = Command::new("ssh");
+    askpass.apply(&mut cmd);
+    cmd.arg("-o")
+        .arg("PreferredAuthentications=password")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=1");
+    Ok((cmd, askpass))
+}
+

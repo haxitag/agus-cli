@@ -58,7 +58,11 @@ pub struct Executor {
 pub struct DbMigrationSpec {
     pub plan_id: String,
     pub connection: DbConnectionConfig,
+    /// Forward migration SQL (up).
     pub sql: String,
+    /// Optional reverse SQL. When present, `rollback_step` executes it; otherwise RollbackNotSupported.
+    #[serde(default)]
+    pub down_sql: Option<String>,
 }
 
 impl Executor {
@@ -665,6 +669,11 @@ impl ExecutionSession {
         Ok(self.records.clone())
     }
 
+    /// Whether this in-memory session tracks the given step (any status).
+    pub fn owns_step(&self, step_id: &str) -> bool {
+        self.statuses.contains_key(step_id) || self.steps_by_id.contains_key(step_id)
+    }
+
     pub fn is_halted(&self) -> bool {
         self.halted
     }
@@ -792,13 +801,46 @@ impl ExecutionSession {
                     }
                 }
             },
-            DeploymentAction::DbMigrate { plan_id } => {
-                return Err(ExecutionError::RollbackNotSupported {
-                    message: format!(
-                        "db migrate rollback not supported for plan {plan_id} (no down_sql / snapshot model yet)"
-                    ),
-                });
-            }
+            DeploymentAction::DbMigrate { plan_id } => match &self.mode {
+                ExecutionMode::DbMigration {
+                    host,
+                    client,
+                    migrations,
+                } => {
+                    let migration = migrations.get(plan_id).ok_or_else(|| {
+                        ExecutionError::RollbackNotSupported {
+                            message: format!(
+                                "db migration spec for plan {plan_id} missing from session; cannot rollback"
+                            ),
+                        }
+                    })?;
+                    let down = migration
+                        .down_sql
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| ExecutionError::RollbackNotSupported {
+                            message: format!(
+                                "db migrate rollback not supported for plan {plan_id}: no down_sql provided"
+                            ),
+                        })?;
+                    if let Some(ref stream) = self.log_stream {
+                        stream.warning(&step_id, &format!("Rollback db migrate {plan_id} via down_sql"));
+                    }
+                    let rollback_spec = DbMigrationSpec {
+                        plan_id: format!("{plan_id}__down"),
+                        connection: migration.connection.clone(),
+                        sql: down.to_string(),
+                        down_sql: None,
+                    };
+                    execute_db_migration(client.as_ref(), host, &rollback_spec)
+                }
+                _ => {
+                    return Err(ExecutionError::RollbackNotSupported {
+                        message: "db migrate rollback requires db_migration execution mode".to_string(),
+                    });
+                }
+            },
             other => {
                 return Err(ExecutionError::RollbackNotSupported {
                     message: format!("rollback not supported for action {other:?} on step {step_id}"),
@@ -2379,6 +2421,7 @@ mod tests {
                 database: "app".to_string(),
             },
             sql: sql.to_string(),
+            down_sql: None,
         }
     }
 
@@ -2709,6 +2752,82 @@ mod tests {
 
         let result = session.run();
         assert!(matches!(result, Err(ExecutionError::InvalidPlan { .. })));
+    }
+
+    #[test]
+    fn db_migrate_rollback_uses_down_sql() {
+        let plan = DeploymentPlan {
+            steps: vec![DeploymentStep {
+                id: "db:migrate".to_string(),
+                service_name: "db".to_string(),
+                action: DeploymentAction::DbMigrate {
+                    plan_id: "plan-1".to_string(),
+                },
+                depends_on: Vec::new(),
+                approval_required: true,
+                memo: None,
+            }],
+        };
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = RecordingSshClient::new(HashMap::new(), commands);
+        let host = HostContext {
+            host: "127.0.0.1".to_string(),
+            user: "tester".to_string(),
+            port: 22,
+            environment: Environment::Dev,
+        };
+        let mut spec = db_migration_spec("plan-1", "ALTER TABLE users ADD COLUMN email text;");
+        spec.down_sql = Some("ALTER TABLE users DROP COLUMN email;".to_string());
+        let executor = Executor::new();
+        let mut session = executor
+            .start_db_migration(plan, host, client, vec![spec])
+            .expect("start");
+        session.run().expect("wait approval");
+        session.approve_step("db:migrate").expect("migrate");
+        let records = session.rollback_step("db:migrate").expect("rollback");
+        let record = records
+            .iter()
+            .rev()
+            .find(|r| r.step_id == "db:migrate")
+            .expect("rollback record");
+        assert!(matches!(record.status, ExecutionStatus::RolledBack));
+    }
+
+    #[test]
+    fn db_migrate_rollback_without_down_sql_is_rejected() {
+        let plan = DeploymentPlan {
+            steps: vec![DeploymentStep {
+                id: "db:migrate".to_string(),
+                service_name: "db".to_string(),
+                action: DeploymentAction::DbMigrate {
+                    plan_id: "plan-1".to_string(),
+                },
+                depends_on: Vec::new(),
+                approval_required: true,
+                memo: None,
+            }],
+        };
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = RecordingSshClient::new(HashMap::new(), commands);
+        let host = HostContext {
+            host: "127.0.0.1".to_string(),
+            user: "tester".to_string(),
+            port: 22,
+            environment: Environment::Dev,
+        };
+        let executor = Executor::new();
+        let mut session = executor
+            .start_db_migration(
+                plan,
+                host,
+                client,
+                vec![db_migration_spec("plan-1", "SELECT 1;")],
+            )
+            .expect("start");
+        session.run().expect("wait");
+        session.approve_step("db:migrate").expect("up");
+        let err = session.rollback_step("db:migrate").expect_err("no down_sql");
+        assert!(matches!(err, ExecutionError::RollbackNotSupported { .. }));
     }
 
     #[test]

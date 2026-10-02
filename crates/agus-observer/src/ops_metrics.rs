@@ -14,6 +14,10 @@ pub struct OpsCustomMetrics {
     pub api_latency_p99: Option<f64>,
     /// 数据库连接占用百分比（0-100），基于观测连接数 / 软上限
     pub db_connections_usage: Option<f64>,
+    /// nginx stub_status 两次采样推算的 request/s（真实 Δrequests/Δt；无 stub 则为 None）
+    pub request_rate: Option<f64>,
+    /// stub_status Active connections（瞬时值，非假造）
+    pub nginx_active_connections: Option<f64>,
     /// 采集说明（哪些探针成功/失败），供日志与 UI
     pub notes: Vec<String>,
 }
@@ -33,7 +37,46 @@ impl OpsCustomMetrics {
         if let Some(v) = self.db_connections_usage {
             map.insert("db_connections_usage".to_string(), v);
         }
+        if let Some(v) = self.request_rate {
+            map.insert("request_rate".to_string(), v);
+            // 业务分析 has_business_probe 识别键
+            map.insert("qps".to_string(), v);
+        }
+        if let Some(v) = self.nginx_active_connections {
+            map.insert("nginx_active_connections".to_string(), v);
+        }
         map
+    }
+}
+
+/// 解析 nginx stub_status 正文中的 requests 累计值与 Active connections。
+pub fn parse_nginx_stub_status(body: &str) -> Option<(u64, u64)> {
+    // Active connections: 291
+    // server accepts handled requests
+    //  16630948 16630948 31070465
+    let mut active = None;
+    let mut requests = None;
+    let mut saw_header = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Active connections:") {
+            active = rest.trim().parse().ok();
+        }
+        if t.contains("accepts") && t.contains("handled") && t.contains("requests") {
+            saw_header = true;
+            continue;
+        }
+        if saw_header && requests.is_none() {
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            if parts.len() >= 3 {
+                requests = parts[2].parse().ok();
+                saw_header = false;
+            }
+        }
+    }
+    match (active, requests) {
+        (Some(a), Some(r)) => Some((a, r)),
+        _ => None,
     }
 }
 
@@ -186,7 +229,7 @@ echo "$total"
                 let usage = ((n as f64) / 100.0 * 100.0).min(100.0);
                 out.db_connections_usage = Some(usage);
                 out.notes.push(format!(
-                    "db_connections_usage={usage:.1}% (observed_est_conns={n}, soft_cap=100)"
+                    "db_connections_usage={usage:.1}% (observed_est_conns={n}, soft_cap=100; NOT max_connections — estimate only)"
                 ));
             } else if let Some(v) = parse_f64_line(&res.stdout) {
                 out.db_connections_usage = Some(v.min(100.0));
@@ -199,6 +242,68 @@ echo "$total"
             .notes
             .push("db_connections_usage: ss/netstat probe failed".into()),
         Err(e) => out.notes.push(format!("db_connections_usage: {e}")),
+    }
+
+    // --- nginx stub_status：两次采样推算真实 request_rate（无 stub 则保持 None，禁止编造）---
+    let stub_cmd = r#"
+set +e
+url=""
+for u in \
+  "http://127.0.0.1/nginx_status" \
+  "http://127.0.0.1/status" \
+  "http://127.0.0.1:8080/nginx_status"
+do
+  body=$(curl -s --connect-timeout 1 --max-time 2 "$u" 2>/dev/null)
+  if echo "$body" | grep -q 'Active connections'; then
+    url="$u"
+    echo "__STUB1__"
+    echo "$body"
+    sleep 2
+    body2=$(curl -s --connect-timeout 1 --max-time 2 "$u" 2>/dev/null)
+    echo "__STUB2__"
+    echo "$body2"
+    exit 0
+  fi
+done
+echo "__NO_STUB__"
+"#;
+    match client.execute(target, stub_cmd) {
+        Ok(res) if res.exit_code == 0 => {
+            let stdout = res.stdout;
+            if stdout.contains("__NO_STUB__") {
+                out.notes
+                    .push("request_rate: nginx stub_status not available on common local URLs".into());
+            } else if let (Some(i1), Some(i2)) =
+                (stdout.find("__STUB1__"), stdout.find("__STUB2__"))
+            {
+                let body1 = &stdout[i1 + "__STUB1__".len()..i2];
+                let body2 = &stdout[i2 + "__STUB2__".len()..];
+                match (parse_nginx_stub_status(body1), parse_nginx_stub_status(body2)) {
+                    (Some((active, r1)), Some((_, r2))) => {
+                        out.nginx_active_connections = Some(active as f64);
+                        if r2 >= r1 {
+                            let rate = (r2 - r1) as f64 / 2.0;
+                            out.request_rate = Some(rate);
+                            out.notes.push(format!(
+                                "request_rate={rate:.2}/s (nginx stub_status Δrequests over 2s; active={active})"
+                            ));
+                        } else {
+                            out.notes.push(
+                                "request_rate: stub counter went backwards; skipped".into(),
+                            );
+                        }
+                    }
+                    _ => out
+                        .notes
+                        .push("request_rate: failed to parse stub_status body".into()),
+                }
+            } else {
+                out.notes
+                    .push("request_rate: unexpected stub probe output".into());
+            }
+        }
+        Ok(_) => out.notes.push("request_rate: stub probe command failed".into()),
+        Err(e) => out.notes.push(format!("request_rate: {e}")),
     }
 
     out
@@ -215,5 +320,16 @@ mod tests {
         let map = m.into_map();
         assert_eq!(map.get("auth_failure_burst"), Some(&3.0));
         assert!(!map.contains_key("api_latency_p95"));
+    }
+
+    #[test]
+    fn parses_nginx_stub_status() {
+        let body = "Active connections: 291 \n\
+server accepts handled requests\n \
+ 16630948 16630948 31070465 \n\
+Reading: 6 Writing: 179 Waiting: 106 \n";
+        let (active, reqs) = parse_nginx_stub_status(body).expect("parse");
+        assert_eq!(active, 291);
+        assert_eq!(reqs, 31_070_465);
     }
 }

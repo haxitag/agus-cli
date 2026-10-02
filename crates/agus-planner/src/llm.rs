@@ -1029,12 +1029,39 @@ pub struct OllamaLlmProvider {
     client: reqwest::Client,
 }
 
+/// 规范化 Ollama 根地址。用户常误填 `.../v1`（OpenAI 兼容前缀）或 `.../api`，
+/// 而本实现使用原生 `/api/chat`、`/api/generate`，误填会导致 404。
+pub fn normalize_ollama_base_url(raw: &str) -> String {
+    let mut url = raw.trim().trim_end_matches('/').to_string();
+    for suffix in ["/v1/chat/completions", "/v1", "/api/chat", "/api/generate", "/api"] {
+        if url.len() > suffix.len() && url.to_ascii_lowercase().ends_with(suffix) {
+            url.truncate(url.len() - suffix.len());
+            url = url.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    if url.is_empty() {
+        "http://localhost:11434".to_string()
+    } else {
+        url
+    }
+}
+
 impl OllamaLlmProvider {
     pub fn new(config: LlmConfig) -> Self {
         Self {
             config,
             client: reqwest::Client::new(),
         }
+    }
+
+    fn root_url(&self) -> String {
+        normalize_ollama_base_url(
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("http://localhost:11434"),
+        )
     }
 
     async fn call_api(&self, prompt: &str) -> Result<String, LlmError> {
@@ -1046,14 +1073,15 @@ impl OllamaLlmProvider {
         prompt: &str,
         max_retries: u32,
     ) -> Result<String, LlmError> {
-        let default_url = "http://localhost:11434".to_string();
-        let base_url = self.config.base_url.as_ref().unwrap_or(&default_url);
+        let base_url = self.root_url();
         let url = format!("{}/api/generate", base_url);
 
+        // think:false —— qwen3.5/thinking 模型否则常把 num_predict 耗尽在 thinking，content 为空
         let body = serde_json::json!({
             "model": self.config.model,
             "prompt": prompt,
-            "stream": false
+            "stream": false,
+            "think": false
         });
 
         let mut last_error = None;
@@ -1086,21 +1114,35 @@ impl OllamaLlmProvider {
                         }
                     } else {
                         let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        let body_snip: String = body.chars().take(300).collect();
                         // 对于 4xx 错误，不重试
                         if status.is_client_error() {
                             return Err(LlmError::ApiError {
                                 message: format!(
-                                    "API returned status: {} (client error, not retrying)",
-                                    status
+                                    "Ollama {} at {} — {}{}",
+                                    status,
+                                    url,
+                                    if body_snip.is_empty() {
+                                        "client error".to_string()
+                                    } else {
+                                        body_snip
+                                    },
+                                    if status.as_u16() == 404 {
+                                        "（若 base_url 带了 /v1，请改为 http://localhost:11434；或确认 ollama list 中有该模型）"
+                                    } else {
+                                        ""
+                                    }
                                 ),
                             });
                         }
                         last_error = Some(LlmError::ApiError {
                             message: format!(
-                                "API returned status: {} (attempt {}/{})",
+                                "API returned status: {} (attempt {}/{}) {}",
                                 status,
                                 attempt + 1,
-                                max_retries
+                                max_retries,
+                                body_snip
                             ),
                         });
                     }
@@ -1467,11 +1509,7 @@ Respond ONLY with valid JSON, no markdown formatting."#,
         max_tokens: Option<u32>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + '_>> {
         let client = self.client.clone();
-        let base_url = self
-            .config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
+        let base_url = self.root_url();
         let model = self.config.model.clone();
         let prompt = prompt.to_string();
         let system_prompt = system_prompt.unwrap_or("").to_string();
@@ -1505,7 +1543,9 @@ Respond ONLY with valid JSON, no markdown formatting."#,
             let body = serde_json::json!({
                 "model": model,
                 "messages": messages_arr,
-                "stream": true
+                "stream": true,
+                "think": false,
+                "options": { "num_predict": num_predict }
             });
 
             let request = client
@@ -1516,14 +1556,34 @@ Respond ONLY with valid JSON, no markdown formatting."#,
             match request.send().await {
                 Ok(response) => {
                     if !response.status().is_success() {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        let body_snip: String = body.chars().take(300).collect();
+                        let hint = if status.as_u16() == 404 {
+                            "（若 base_url 带了 /v1，请改为 http://localhost:11434；或确认 ollama list 中有该模型）"
+                        } else {
+                            ""
+                        };
                         let _ = tx.send(Err(LlmError::ApiError {
-                            message: format!("API returned status: {}", response.status()),
+                            message: format!(
+                                "Ollama {} at {} — {}{}",
+                                status,
+                                url,
+                                if body_snip.is_empty() {
+                                    "empty body".to_string()
+                                } else {
+                                    body_snip
+                                },
+                                hint
+                            ),
                         }));
                         return;
                     }
 
                     let mut stream = response.bytes_stream();
                     let mut buffer = String::new();
+                    let mut saw_content = false;
+                    let mut reasoning_buf = String::new();
 
                     use futures_util::StreamExt as _;
                     while let Some(item) = stream.next().await {
@@ -1558,6 +1618,7 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                                                     message.get("thinking").and_then(|t| t.as_str())
                                                 {
                                                     if !thinking.is_empty() {
+                                                        reasoning_buf.push_str(thinking);
                                                         let _ = tx.send(Ok(StreamChunk::Reasoning(thinking.to_string())));
                                                     }
                                                 }
@@ -1566,6 +1627,7 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                                                     message.get("content").and_then(|c| c.as_str())
                                                 {
                                                     if !content.is_empty() {
+                                                        saw_content = true;
                                                         let _ = tx.send(Ok(StreamChunk::Content(content.to_string())));
                                                     }
                                                 }
@@ -1576,6 +1638,7 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                                                 json.get("response").and_then(|r| r.as_str())
                                             {
                                                 if !response.is_empty() {
+                                                    saw_content = true;
                                                     let _ = tx.send(Ok(StreamChunk::Content(response.to_string())));
                                                 }
                                             }
@@ -1585,6 +1648,29 @@ Respond ONLY with valid JSON, no markdown formatting."#,
                                                 .and_then(|d| d.as_bool())
                                                 .unwrap_or(false)
                                             {
+                                                // thinking 模型耗尽 token 时 content 可能仍为空：回退输出 reasoning 摘要
+                                                if !saw_content && !reasoning_buf.is_empty() {
+                                                    let fallback = if reasoning_buf.chars().count() > 1200 {
+                                                        let tail: String = reasoning_buf
+                                                            .chars()
+                                                            .rev()
+                                                            .take(1200)
+                                                            .collect::<String>()
+                                                            .chars()
+                                                            .rev()
+                                                            .collect();
+                                                        format!(
+                                                            "（模型仅返回思考过程、无正式答案，已截取末段供参考）\n{}",
+                                                            tail
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "（模型仅返回思考过程、无正式答案）\n{}",
+                                                            reasoning_buf
+                                                        )
+                                                    };
+                                                    let _ = tx.send(Ok(StreamChunk::Content(fallback)));
+                                                }
                                                 return;
                                             }
                                         }
@@ -3696,4 +3782,45 @@ fn validate_llm_plan(plan: &LLMDeploymentPlanResponse) -> Result<(), LlmError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod ollama_url_tests {
+    use super::normalize_ollama_base_url;
+
+    #[test]
+    fn strips_openai_v1_suffix() {
+        assert_eq!(
+            normalize_ollama_base_url("http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_ollama_base_url("http://127.0.0.1:11434/v1/"),
+            "http://127.0.0.1:11434"
+        );
+        assert_eq!(
+            normalize_ollama_base_url("http://localhost:11434/v1/chat/completions"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn strips_native_api_suffix() {
+        assert_eq!(
+            normalize_ollama_base_url("http://localhost:11434/api"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_ollama_base_url("http://localhost:11434/api/chat"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn keeps_plain_root() {
+        assert_eq!(
+            normalize_ollama_base_url("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+    }
 }
